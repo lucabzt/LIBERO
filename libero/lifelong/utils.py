@@ -121,8 +121,10 @@ def create_experiment_dir(cfg):
     if cfg.task_embedding_format == "roberta":
         prefix += f"_roberta"
 
+    # NEW: add an output dir parameter to save whereever you want
+    output_dir = cfg.output_dir if cfg.output_dir is not None else f"./{prefix}"
     experiment_dir = (
-        f"./{prefix}/{cfg.benchmark_name}/{cfg.lifelong.algo}/"
+        f"{output_dir}/{cfg.benchmark_name}/{cfg.lifelong.algo}/"
         + f"{cfg.policy.policy_type}_seed{cfg.seed}"
     )
 
