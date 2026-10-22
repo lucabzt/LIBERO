@@ -4,8 +4,28 @@ import numpy as np
 import robomimic.utils.file_utils as FileUtils
 import robomimic.utils.obs_utils as ObsUtils
 from PIL import Image
-from robomimic.utils.dataset import SequenceDataset
+from robomimic.utils.dataset import SequenceDataset as _RobomimicSequenceDataset
 from torch.utils.data import Dataset
+
+
+class SequenceDataset(_RobomimicSequenceDataset):
+    """
+    Picklable for DataLoader workers under the 'spawn' start method: drops the open
+    h5py handle (robomimic reopens it lazily on first access) and carries robomimic's
+    global obs spec along, since a spawned worker starts with it uninitialized.
+    """
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        state["_hdf5_file"] = None
+        state["_obs_modalities_to_keys"] = ObsUtils.OBS_MODALITIES_TO_KEYS
+        return state
+
+    def __setstate__(self, state):
+        obs_modalities_to_keys = state.pop("_obs_modalities_to_keys", None)
+        if ObsUtils.OBS_KEYS_TO_MODALITIES is None and obs_modalities_to_keys:
+            ObsUtils.initialize_obs_utils_with_obs_specs({"obs": obs_modalities_to_keys})
+        self.__dict__.update(state)
 
 """
     Helper function from Robomimic to read hdf5 demonstrations into sequence dataset

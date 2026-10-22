@@ -56,7 +56,7 @@ def torch_save_model(model, model_path, cfg=None, previous_masks=None):
 
 
 def torch_load_model(model_path, map_location=None):
-    model_dict = torch.load(model_path, map_location=map_location)
+    model_dict = torch.load(model_path, map_location=map_location, weights_only=False)
     cfg = None
     if "cfg" in model_dict:
         cfg = model_dict["cfg"]
@@ -121,8 +121,10 @@ def create_experiment_dir(cfg):
     if cfg.task_embedding_format == "roberta":
         prefix += f"_roberta"
 
+    # NEW: add an output dir parameter to save whereever you want
+    output_dir = cfg.output_dir if cfg.output_dir is not None else f"./{prefix}"
     experiment_dir = (
-        f"./{prefix}/{cfg.benchmark_name}/{cfg.lifelong.algo}/"
+        f"{output_dir}/{cfg.benchmark_name}/{cfg.lifelong.algo}/"
         + f"{cfg.policy.policy_type}_seed{cfg.seed}"
     )
 
