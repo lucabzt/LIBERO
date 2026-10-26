@@ -93,8 +93,12 @@ def main(hydra_cfg):
 
     gsz = cfg.data.task_group_size
     if gsz == 1:  # each manipulation task is its own lifelong learning task
+        # clone(): the embeddings are views of one tensor. Spawned DataLoader workers get
+        # one fd per tensor storage, and Python < 3.9 rejects the resulting duplicate fds
+        # ("bad value(s) in fds_to_keep") once several tasks share a DataLoader (multitask).
         datasets = [
-            SequenceVLDataset(ds, emb) for (ds, emb) in zip(manip_datasets, task_embs)
+            SequenceVLDataset(ds, emb.clone())
+            for (ds, emb) in zip(manip_datasets, task_embs)
         ]
         n_demos = [data.n_demos for data in datasets]
         n_sequences = [data.total_num_sequences for data in datasets]

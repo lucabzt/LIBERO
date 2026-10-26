@@ -3,6 +3,7 @@ import os
 import glob
 import random
 import torch
+from libero.libero.utils.torch_utils import torch_load
 
 from typing import List, NamedTuple, Type
 from libero.libero import get_libero_path
@@ -161,7 +162,7 @@ class Benchmark(abc.ABC):
             self.tasks[i].problem_folder,
             self.tasks[i].init_states_file,
         )
-        init_states = torch.load(init_states_path, weights_only=False)
+        init_states = torch_load(init_states_path)
         return init_states
 
     def set_task_embs(self, task_embs):

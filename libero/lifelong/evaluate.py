@@ -10,6 +10,7 @@ import numpy as np
 import pprint
 import time
 import torch
+from libero.libero.utils.torch_utils import torch_load
 import wandb
 import yaml
 from easydict import EasyDict
@@ -251,7 +252,7 @@ def main():
         init_states_path = os.path.join(
             cfg.init_states_folder, task.problem_folder, task.init_states_file
         )
-        init_states = torch.load(init_states_path, weights_only=False)
+        init_states = torch_load(init_states_path)
         indices = np.arange(env_num) % init_states.shape[0]
         init_states_ = init_states[indices]
 
