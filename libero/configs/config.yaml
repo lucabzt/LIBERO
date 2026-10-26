@@ -23,3 +23,5 @@ task_embedding_one_hot_offset: 1
 pretrain: false
 pretrain_model_path: ""
 benchmark_name: "LIBERO_SPATIAL"
+task_names: null # optional list of task names (in this order) to restrict the benchmark to
+max_tasks: null # optional: only run the first max_tasks tasks

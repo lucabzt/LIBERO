@@ -1,0 +1,4 @@
+name: torch.optim.Adam
+
+kwargs:
+    lr: 0.0001

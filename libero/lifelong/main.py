@@ -21,7 +21,12 @@ from libero.libero import get_libero_path
 from libero.libero.benchmark import get_benchmark
 from libero.lifelong.algos import get_algo_class, get_algo_list
 from libero.lifelong.models import get_policy_list
-from libero.lifelong.datasets import GroupedTaskDataset, SequenceVLDataset, get_dataset
+from libero.lifelong.datasets import (
+    GroupedTaskDataset,
+    SequenceVLDataset,
+    get_dataset,
+    get_normalizer_stats,
+)
 from libero.lifelong.metric import evaluate_loss, evaluate_success
 from libero.lifelong.utils import (
     NpEncoder,
@@ -32,6 +37,21 @@ from libero.lifelong.utils import (
     create_experiment_dir,
     get_task_embs,
 )
+
+
+def select_tasks(benchmark, task_names=None, max_tasks=None):
+    """
+    Restrict the benchmark to the given task names (in the given order) and/or to
+    its first max_tasks tasks.
+    """
+    if task_names is not None:
+        by_name = {task.name: task for task in benchmark.tasks}
+        unknown = [name for name in task_names if name not in by_name]
+        assert not unknown, f"[error] unknown tasks {unknown}, available: {list(by_name)}"
+        benchmark.tasks = [by_name[name] for name in task_names]
+    if max_tasks is not None:
+        benchmark.tasks = benchmark.tasks[:max_tasks]
+    benchmark.n_tasks = len(benchmark.tasks)
 
 
 @hydra.main(config_path="../configs", config_name="config", version_base=None)
@@ -59,6 +79,7 @@ def main(hydra_cfg):
     cfg.init_states_folder = cfg.init_states_folder or get_libero_path("init_states")
 
     benchmark = get_benchmark(cfg.benchmark_name)(cfg.data.task_order_index)
+    select_tasks(benchmark, cfg.task_names, cfg.max_tasks)
     n_manip_tasks = benchmark.n_tasks
 
     # prepare datasets from the benchmark
@@ -76,6 +97,7 @@ def main(hydra_cfg):
                 obs_modality=cfg.data.obs.modality,
                 initialize_obs_utils=(i == 0),
                 seq_len=cfg.data.seq_len,
+                frame_stack=cfg.data.frame_stack,
             )
         except Exception as e:
             print(
@@ -134,6 +156,10 @@ def main(hydra_cfg):
     # prepare experiment and update the config
     create_experiment_dir(cfg)
     cfg.shape_meta = shape_meta
+    # min/max of actions and low-dim obs over all tasks of this run (DiffusionPolicy normalizer)
+    cfg.normalizer_stats = get_normalizer_stats(
+        manip_datasets, cfg.data.obs.modality.low_dim
+    )
 
     if cfg.use_wandb:
         wandb.init(project="libero", config=cfg)
