@@ -21,7 +21,12 @@ from libero.libero import get_libero_path
 from libero.libero.benchmark import get_benchmark
 from libero.lifelong.algos import get_algo_class, get_algo_list
 from libero.lifelong.models import get_policy_list
-from libero.lifelong.datasets import GroupedTaskDataset, SequenceVLDataset, get_dataset
+from libero.lifelong.datasets import (
+    GroupedTaskDataset,
+    SequenceVLDataset,
+    get_dataset,
+    get_normalizer_stats,
+)
 from libero.lifelong.metric import evaluate_loss, evaluate_success
 from libero.lifelong.utils import (
     NpEncoder,
@@ -76,6 +81,7 @@ def main(hydra_cfg):
                 obs_modality=cfg.data.obs.modality,
                 initialize_obs_utils=(i == 0),
                 seq_len=cfg.data.seq_len,
+                frame_stack=cfg.data.frame_stack,
             )
         except Exception as e:
             print(
@@ -134,6 +140,10 @@ def main(hydra_cfg):
     # prepare experiment and update the config
     create_experiment_dir(cfg)
     cfg.shape_meta = shape_meta
+    # min/max of actions and low-dim obs over all tasks of this run (DiffusionPolicy normalizer)
+    cfg.normalizer_stats = get_normalizer_stats(
+        manip_datasets, cfg.data.obs.modality.low_dim
+    )
 
     if cfg.use_wandb:
         wandb.init(project="libero", config=cfg)

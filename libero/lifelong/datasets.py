@@ -1,5 +1,6 @@
 import copy
 
+import h5py
 import numpy as np
 import robomimic.utils.file_utils as FileUtils
 import robomimic.utils.obs_utils as ObsUtils
@@ -77,6 +78,26 @@ def get_dataset(
         filter_by_attribute=filter_key,  # can optionally provide a filter key here
     )
     return dataset, shape_meta
+
+
+def get_normalizer_stats(sequence_datasets, low_dim_keys):
+    """
+    Per-dimension min/max of the actions and low-dim obs over all demos of the given
+    SequenceDatasets, as {key: {"min": list, "max": list}}.
+    """
+    keys = {"action": "actions"}
+    keys.update({key: f"obs/{key}" for key in low_dim_keys})
+    values = {key: [] for key in keys}
+    for dataset in sequence_datasets:
+        with h5py.File(dataset.hdf5_path, "r") as f:
+            for demo in dataset.demos:
+                for key, path in keys.items():
+                    values[key].append(f[f"data/{demo}/{path}"][()])
+    stats = {}
+    for key, arrays in values.items():
+        data = np.concatenate(arrays, axis=0).astype(np.float32)
+        stats[key] = {"min": data.min(axis=0).tolist(), "max": data.max(axis=0).tolist()}
+    return stats
 
 
 class SequenceVLDataset(Dataset):

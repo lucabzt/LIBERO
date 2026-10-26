@@ -1,0 +1,57 @@
+# Diffusion policy (Memory Anchors DiffusionUnetTimmPolicy), LIBERO setup of the paper (App. B.2).
+# Requires data.frame_stack=${policy.n_obs_steps} and data.seq_len=${policy.horizon}.
+policy_type: DiffusionPolicy
+
+n_obs_steps: 2
+horizon: 16
+# actions executed per prediction before replanning (not stated in the paper)
+n_action_steps: 8
+num_inference_steps: 16
+
+# LIBERO actions: delta position, delta axis-angle rotation, gripper
+action_components:
+  - {type: pos, size: 3}
+  - {type: rot_axis_angle, size: 3}
+  - {type: gripper, size: 1}
+
+# DDIM for training noise and inference; 100 train steps as in the paper's
+# noise-denoise setup ("step 20 on a DDIM step schedule of 100")
+noise_scheduler:
+  num_train_timesteps: 100
+  beta_start: 0.0001
+  beta_end: 0.02
+  beta_schedule: squaredcos_cap_v2
+  clip_sample: true
+  set_alpha_to_one: true
+  steps_offset: 0
+  prediction_type: epsilon
+
+obs_encoder:
+  model_name: resnet18
+  pretrained: false
+  frozen: false
+  global_pool: ""
+  transforms:
+    - {type: RandomCrop, ratio: 0.9}
+  use_group_norm: true
+  share_rgb_model: false
+  imagenet_norm: false
+  feature_aggregation: spatial_embedding
+  downsample_ratio: 32
+
+unet:
+  obs_as_global_cond: true
+  diffusion_step_embed_dim: 128
+  down_dims: [256, 512, 1024]
+  kernel_size: 5
+  n_groups: 8
+  cond_predict_scale: true
+  input_pertub: 0.1
+  ood_metric: l2
+
+# BasePolicy builds these augmentations; DiffusionPolicy does not use them (it uses the
+# encoder's random crop). language_encoder only provides the task embedding size.
+defaults:
+    - data_augmentation@color_aug: batch_wise_img_color_jitter_group_aug.yaml
+    - data_augmentation@translation_aug: translation_aug.yaml
+    - language_encoder: mlp_encoder.yaml
