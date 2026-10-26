@@ -7,6 +7,7 @@ from pathlib import Path
 import numpy as np
 import robomimic.utils.tensor_utils as TensorUtils
 import torch
+from libero.libero.utils.torch_utils import torch_load
 import torch.nn as nn
 from hydra.utils import to_absolute_path
 from thop import profile
@@ -56,7 +57,7 @@ def torch_save_model(model, model_path, cfg=None, previous_masks=None):
 
 
 def torch_load_model(model_path, map_location=None):
-    model_dict = torch.load(model_path, map_location=map_location, weights_only=False)
+    model_dict = torch_load(model_path, map_location=map_location)
     cfg = None
     if "cfg" in model_dict:
         cfg = model_dict["cfg"]

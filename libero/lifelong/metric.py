@@ -6,6 +6,7 @@ import robomimic.utils.obs_utils as ObsUtils
 import robomimic.utils.tensor_utils as TensorUtils
 import time
 import torch
+from libero.libero.utils.torch_utils import torch_load
 import torch.multiprocessing as mp
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
@@ -104,7 +105,7 @@ def evaluate_one_task_success(
         init_states_path = os.path.join(
             cfg.init_states_folder, task.problem_folder, task.init_states_file
         )
-        init_states = torch.load(init_states_path, weights_only=False)
+        init_states = torch_load(init_states_path)
         num_success = 0
         for i in range(eval_loop_num):
             env.reset()
