@@ -80,6 +80,8 @@ class DictOfTensorMixin(nn.Module):
                     dfs_add(out_dict, param_keys, value.clone())
             return out_dict
 
-        self.params_dict = load_dict(state_dict, prefix + 'params_dict')
+        # LIBERO: keep the module's device (state dicts may be loaded with map_location='cpu')
+        device = next(iter(self.parameters()), torch.empty(0)).device
+        self.params_dict = load_dict(state_dict, prefix + 'params_dict').to(device)
         self.params_dict.requires_grad_(False)
         return 
