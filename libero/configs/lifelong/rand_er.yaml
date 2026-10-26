@@ -1,0 +1,3 @@
+algo: RandER
+# fraction of all past task transitions kept in the replay buffer (resampled every task)
+buffer_fraction: 0.01
