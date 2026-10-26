@@ -28,6 +28,8 @@ from libero.lifelong.datasets import (
     get_normalizer_stats,
 )
 from libero.lifelong.metric import evaluate_loss, evaluate_success
+from libero.lifelong.report.interpret_results import write_run_report
+from libero.libero.utils.torch_utils import torch_load
 from libero.lifelong.utils import (
     NpEncoder,
     compute_flops,
@@ -37,6 +39,20 @@ from libero.lifelong.utils import (
     create_experiment_dir,
     get_task_embs,
 )
+
+
+# algorithms whose state after a task is fully given by the policy checkpoint and end_task
+RESUMABLE_ALGOS = ["Sequential", "SingleTask", "ER", "RandER"]
+
+
+def save_report(experiment_dir):
+    # a failing report must not end a long training run
+    try:
+        report = write_run_report(experiment_dir)
+        if report is not None:
+            print(f"[info] wrote {report}")
+    except Exception as e:
+        print(f"[warning] could not write the report: {e!r}")
 
 
 @hydra.main(config_path="../configs", config_name="config", version_base=None)
@@ -138,7 +154,7 @@ def main(hydra_cfg):
     print("=======================================================================\n")
 
     # prepare experiment and update the config
-    create_experiment_dir(cfg)
+    create_experiment_dir(cfg, reuse_latest=cfg.resume)
     cfg.shape_meta = shape_meta
     # min/max of actions and low-dim obs over all tasks of this run (DiffusionPolicy normalizer)
     cfg.normalizer_stats = get_normalizer_stats(
@@ -155,6 +171,20 @@ def main(hydra_cfg):
         "L_fwd": np.zeros((n_manip_tasks,)),  # loss AUC, how fast the agent learns
         "S_fwd": np.zeros((n_manip_tasks,)),  # success AUC, how fast the agent succeeds
     }
+
+    # resume: continue after the last task that was trained and evaluated
+    n_tasks_done = 0
+    result_file = os.path.join(cfg.experiment_dir, "result.pt")
+    if cfg.resume and os.path.exists(result_file):
+        assert cfg.lifelong.algo in RESUMABLE_ALGOS, (
+            f"[error] resume is only supported for {RESUMABLE_ALGOS}"
+        )
+        result_summary = torch_load(result_file)
+        n_tasks_done = int(result_summary.get("n_tasks_evaluated", 0))
+        if n_tasks_done >= n_manip_tasks // gsz:
+            print(f"[info] {cfg.experiment_dir} is already finished, nothing to resume")
+            return
+        print(f"[info] resuming {cfg.experiment_dir} after task {n_tasks_done - 1}")
 
     if cfg.eval.save_sim_states:
         # for saving the evaluate simulation states, so we can replay them later
@@ -179,6 +209,17 @@ def main(hydra_cfg):
                 f"[error] cannot load pretrained model from {cfg.pretrain_model_path}"
             )
             sys.exit(0)
+
+    if n_tasks_done > 0:
+        # state after the last finished task: its best checkpoint, and the datasets
+        # ER-style algorithms keep for replay
+        algo.policy.load_state_dict(
+            torch_load_model(
+                os.path.join(cfg.experiment_dir, f"task{n_tasks_done - 1}_model.pth")
+            )[0]
+        )
+        for i in range(n_tasks_done):
+            algo.end_task(datasets[i], i, benchmark)
 
     print(f"[info] start lifelong learning with algo {cfg.lifelong.algo}")
     GFLOPs, MParams = compute_flops(algo, datasets[0], cfg)
@@ -224,8 +265,9 @@ def main(hydra_cfg):
             print(("[All task succ.] " + " %4.2f |" * n_tasks) % tuple(S))
 
             torch.save(result_summary, os.path.join(cfg.experiment_dir, f"result.pt"))
+            save_report(cfg.experiment_dir)
     else:
-        for i in range(n_tasks):
+        for i in range(n_tasks_done, n_tasks):
             print(f"[info] start training on task {i}")
             algo.train()
 
@@ -270,9 +312,16 @@ def main(hydra_cfg):
                 )
                 print(("[Task %2d loss ] " + " %4.2f |" * (i + 1)) % (i, *L))
                 print(("[Task %2d succ.] " + " %4.2f |" * (i + 1)) % (i, *S))
+                result_summary["n_tasks_evaluated"] = i + 1
                 torch.save(
                     result_summary, os.path.join(cfg.experiment_dir, f"result.pt")
                 )
+                save_report(cfg.experiment_dir)
+
+            # resume only needs the checkpoint of the last finished task
+            previous_checkpoint = os.path.join(cfg.experiment_dir, f"task{i - 1}_model.pth")
+            if not cfg.train.keep_all_checkpoints and os.path.exists(previous_checkpoint):
+                os.remove(previous_checkpoint)
 
     print("[info] finished learning\n")
     if cfg.use_wandb:

@@ -7,6 +7,10 @@ d) Writing everything into a single markdown report (report.md) inside output_di
 
 If config.json and task{k}_auc.log files lie next to result.pt, they are used to add run
 information, task names and per-epoch learning curves.
+
+libero/lifelong/main.py calls write_run_report after every task, so every run directory
+contains an up-to-date report (of the tasks finished so far). For an existing run:
+    python -m libero.lifelong.report.interpret_results --results_file <run>/result.pt --output_dir <run>
 """
 
 import argparse
@@ -21,7 +25,14 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 
-from metrics import auc_per_task, compute_AUC, compute_ft, compute_NBT, nbt_per_task
+from libero.libero.utils.torch_utils import torch_load
+from libero.lifelong.report.metrics import (
+    auc_per_task,
+    compute_AUC,
+    compute_ft,
+    compute_NBT,
+    nbt_per_task,
+)
 
 # categorical slots, assigned in fixed order
 SERIES = ["#2a78d6", "#eb6834", "#1baf7a"]
@@ -56,7 +67,41 @@ def load_results(results_file: str) -> dict:
     Dict with keys L_conf_mat, S_conf_mat (n_tasks x n_tasks, row = task trained up to,
     column = evaluated task), L_fwd and S_fwd (n_tasks,)
     """
-    return torch.load(results_file)
+    return torch_load(results_file)
+
+
+def n_finished_tasks(results: dict, run_dir: str) -> int:
+    """
+    Number of tasks that have been trained and evaluated so far
+    Args:
+        results: dict loaded by load_results
+        run_dir: directory containing result.pt
+
+    Returns:
+    main.py stores it as n_tasks_evaluated; for older runs the task{k}_auc.log files are counted
+    """
+    if "n_tasks_evaluated" in results:
+        return int(results["n_tasks_evaluated"])
+    n_tasks = np.asarray(results["S_conf_mat"]).shape[0]
+    return sum(os.path.exists(os.path.join(run_dir, f"task{k}_auc.log")) for k in range(n_tasks))
+
+
+def truncate_results(results: dict, n_tasks: int) -> dict:
+    """
+    Restrict the result matrices to the first n_tasks tasks (for partially finished runs)
+    Args:
+        results: dict loaded by load_results
+        n_tasks: number of finished tasks
+
+    Returns:
+    Dict with the same keys as results, restricted to the finished tasks
+    """
+    return {
+        "S_conf_mat": np.asarray(results["S_conf_mat"], dtype=float)[:n_tasks, :n_tasks],
+        "L_conf_mat": np.asarray(results["L_conf_mat"], dtype=float)[:n_tasks, :n_tasks],
+        "S_fwd": np.asarray(results["S_fwd"], dtype=float)[:n_tasks],
+        "L_fwd": np.asarray(results["L_fwd"], dtype=float)[:n_tasks],
+    }
 
 
 def load_config(run_dir: str) -> dict:
@@ -90,7 +135,7 @@ def load_auc_logs(run_dir: str, n_tasks: int) -> list:
         log_file = os.path.join(run_dir, f"task{k}_auc.log")
         if not os.path.exists(log_file):
             return None
-        log = torch.load(log_file)
+        log = torch_load(log_file)
         logs.append({key: np.asarray(value, dtype=float) for key, value in log.items()})
     return logs
 
@@ -130,6 +175,8 @@ def compute_metrics(results: dict, n_eval: int, auc_logs: list = None) -> dict:
     Dict with a "summary" dict of scalars and a "per_task" dict of arrays (n_tasks,)
     """
     success = np.asarray(results["S_conf_mat"], dtype=float)
+    # LIBERO FWT (averaged over the evaluations during training); NaN without per-epoch
+    # success evaluations (train.checkpoint_selection=last_epoch)
     s_fwd = np.asarray(results["S_fwd"], dtype=float)
     n_tasks = success.shape[0]
 
@@ -138,6 +185,8 @@ def compute_metrics(results: dict, n_eval: int, auc_logs: list = None) -> dict:
     # NBT and forgetting are undefined for the last task
     nbt = np.append(nbt_per_task(success).numpy(), np.nan)
     auc = auc_per_task(success, s_fwd).numpy()
+    # Memory Anchors paper (App. B.4): FWT_k = c_kk, AUC_k uses c_kk instead of LIBERO's FWT_k
+    auc_paper = auc_per_task(success, after_learning).numpy()
     # forgetting: best success on task k at any stage before the last one minus final success
     forgetting = np.full(n_tasks, np.nan)
     for k in range(n_tasks - 1):
@@ -147,6 +196,7 @@ def compute_metrics(results: dict, n_eval: int, auc_logs: list = None) -> dict:
 
     per_task = {
         "fwt": s_fwd,
+        "auc_paper": auc_paper,
         "success_after_learning": after_learning,
         "success_after_learning_ci": confidence_interval(after_learning, n_eval),
         "final_success": final,
@@ -157,7 +207,8 @@ def compute_metrics(results: dict, n_eval: int, auc_logs: list = None) -> dict:
         "fwd_loss": np.asarray(results["L_fwd"], dtype=float),
         "avg_seen_success": avg_seen,
     }
-    if auc_logs is not None:
+    with_train_success = auc_logs is not None and all(len(log["success"]) > 0 for log in auc_logs)
+    if with_train_success:
         per_task["zero_shot_success"] = np.array([log["success"][0] for log in auc_logs])
         per_task["best_train_success"] = np.array([log["success"].max() for log in auc_logs])
         per_task["best_eval_idx"] = np.array([log["success"].argmax() for log in auc_logs])
@@ -169,17 +220,33 @@ def compute_metrics(results: dict, n_eval: int, auc_logs: list = None) -> dict:
         "fwt_std": float(s_fwd.std()),
         "nbt_std": float(np.nanstd(nbt)),
         "auc_std": float(auc.std()),
+        # paper definitions, mean and standard error of the mean over tasks
+        "fwt_paper": float(after_learning.mean()),
+        "nbt_paper": float(np.nanmean(nbt)) if n_tasks > 1 else float("nan"),
+        "auc_paper": float(auc_paper.mean()),
+        "fwt_paper_sem": sem(after_learning),
+        "nbt_paper_sem": sem(nbt),
+        "auc_paper_sem": sem(auc_paper),
         "mean_success_after_learning": float(after_learning.mean()),
         "final_avg_success": float(final.mean()),
         "avg_forgetting": float(np.nanmean(forgetting)),
-        "max_forgetting": float(np.nanmax(forgetting)),
+        "max_forgetting": float(np.nanmax(forgetting)) if n_tasks > 1 else float("nan"),
         "fwd_loss": float(per_task["fwd_loss"].mean()),
         "n_tasks": n_tasks,
     }
-    if auc_logs is not None:
+    if with_train_success:
         summary["zero_shot_success"] = float(per_task["zero_shot_success"].mean())
         summary["best_train_success"] = float(per_task["best_train_success"].mean())
     return {"summary": summary, "per_task": per_task}
+
+
+def sem(values: np.ndarray) -> float:
+    """Standard error of the mean over the non-NaN values (NaN for fewer than 2 values)"""
+    values = np.asarray(values, dtype=float)
+    values = values[~np.isnan(values)]
+    if len(values) < 2:
+        return float("nan")
+    return float(values.std(ddof=1) / np.sqrt(len(values)))
 
 
 def confidence_interval(p: np.ndarray, n_eval: int) -> np.ndarray:
@@ -343,19 +410,21 @@ def plot_per_task_transfer(per_task: dict, output_dir: str, title: str = None) -
     x = np.arange(n_tasks)
     panels = [
         ("NBT$_k$ (lower is better)", per_task["nbt"]),
-        ("AUC$_k$ (higher is better)", per_task["auc"]),
+        ("AUC$_k$ (paper def., higher is better)", per_task["auc_paper"]),
     ]
 
     fig, axes = plt.subplots(1, 2, figsize=(max(9, 1.1 * n_tasks + 3), 3.5))
     for ax, (label, values) in zip(axes, panels):
         valid = ~np.isnan(values)
+        mean = values[valid].mean() if valid.any() else np.nan
         ax.bar(x[valid], values[valid], 0.6, color=SERIES[0])
-        ax.axhline(np.nanmean(values), color=MUTED, linestyle="--", linewidth=1.5)
+        if valid.any():
+            ax.axhline(mean, color=MUTED, linestyle="--", linewidth=1.5)
         ax.axhline(0, color=MUTED, linewidth=0.8)
         ax.set_xticks(x)
         ax.set_xticklabels(x + 1)
         ax.set_xlabel("Task")
-        ax.set_title(f"{label}, mean {np.nanmean(values):.2f}")
+        ax.set_title(f"{label}, mean {mean:.2f}")
         ax.grid(axis="x", visible=False)
     if title:
         fig.suptitle(title, fontweight="bold")
@@ -531,6 +600,7 @@ def write_report(
     config: dict = None,
     task_names: list = None,
     title: str = None,
+    n_tasks_total: int = None,
 ) -> str:
     """
     Write a markdown report with all metrics and figures
@@ -545,6 +615,7 @@ def write_report(
         config: config loaded by load_config (optional)
         task_names: task names loaded by load_task_names (optional)
         title: optional report title
+        n_tasks_total: number of tasks of the whole run, if only the first tasks are finished
 
     Returns:
     Path of the report
@@ -554,15 +625,31 @@ def write_report(
     lines = [f"# {title or 'LIBERO results'}", ""]
 
     # headline metrics
+    progress = n_tasks if n_tasks_total is None else f"{n_tasks} of {n_tasks_total}"
     lines += [
         "## Main metrics",
+        "",
+        f"Tasks finished: **{progress}**. Memory Anchors paper definitions (App. B.4), comparable "
+        "to the paper's tables (whose ± is the SEM over 10 tasks × 3 task orders):",
+        "",
+        markdown_table(
+            ["Metric", "Value", "SEM over tasks"],
+            [
+                ["**FWT** ↑ (success right after learning)", f"**{fmt(summary['fwt_paper'], 3)}**", fmt(summary["fwt_paper_sem"], 3)],
+                ["**NBT** ↓ (negative backward transfer)", f"**{fmt(summary['nbt_paper'], 3)}**", fmt(summary["nbt_paper_sem"], 3)],
+                ["**AUC** ↑ (area under the success curve)", f"**{fmt(summary['auc_paper'], 3)}**", fmt(summary["auc_paper_sem"], 3)],
+            ],
+        ),
+        "",
+        "LIBERO definitions (FWT averaged over the evaluations during training; "
+        "– without them, e.g. with last-epoch checkpoints):",
         "",
         markdown_table(
             ["Metric", "Value", "Std. over tasks"],
             [
-                ["**FWT** ↑ (forward transfer)", f"**{fmt(summary['fwt'], 3)}**", fmt(summary["fwt_std"], 3)],
-                ["**NBT** ↓ (negative backward transfer)", f"**{fmt(summary['nbt'], 3)}**", fmt(summary["nbt_std"], 3)],
-                ["**AUC** ↑ (area under the success curve)", f"**{fmt(summary['auc'], 3)}**", fmt(summary["auc_std"], 3)],
+                ["FWT ↑", fmt(summary["fwt"], 3), fmt(summary["fwt_std"], 3)],
+                ["NBT ↓", fmt(summary["nbt"], 3), fmt(summary["nbt_std"], 3)],
+                ["AUC ↑", fmt(summary["auc"], 3), fmt(summary["auc_std"], 3)],
             ],
         ),
         "",
@@ -575,8 +662,11 @@ def write_report(
             ["Benchmark", config.get("benchmark_name")],
             ["Algorithm", config["lifelong"]["algo"]],
             ["Policy", config["policy"]["policy_type"]],
+            ["Algorithm parameters", ", ".join(f"{k}={v}" for k, v in config["lifelong"].items() if k != "algo") or "–"],
             ["Seed", config.get("seed")],
+            ["Task order index", config["data"]["task_order_index"]],
             ["Epochs per task", config["train"]["n_epochs"]],
+            ["Checkpoint per task", config["train"].get("checkpoint_selection", "best_success")],
         ]
     info += [
         ["Tasks", n_tasks],
@@ -643,7 +733,7 @@ def write_report(
         lines += [f"### {heading}", "", f"![{heading}]({rel_path})", "", caption, ""]
 
     # per-task table
-    header = ["Task", "FWT_k", "After learning", "Final", "Forgetting", "NBT_k", "AUC_k"]
+    header = ["Task", "FWT_k (LIBERO)", "After learning (= FWT_k paper)", "Final", "Forgetting", "NBT_k", "AUC_k (LIBERO)", "AUC_k (paper)"]
     if "zero_shot_success" in per_task:
         header += ["Zero-shot", "Best in training", "Best epoch"]
     rows = []
@@ -656,6 +746,7 @@ def write_report(
             fmt(per_task["forgetting"][k]),
             fmt(per_task["nbt"][k]),
             fmt(per_task["auc"][k]),
+            fmt(per_task["auc_paper"][k]),
         ]
         if "zero_shot_success" in per_task:
             row += [
@@ -670,7 +761,7 @@ def write_report(
         lines += [
             "### Task names",
             "",
-            markdown_table(["Task", "Name"], [[k + 1, name.replace("_", " ")] for k, name in enumerate(task_names)]),
+            markdown_table(["Task", "Name"], [[k + 1, name.replace("_", " ")] for k, name in enumerate(task_names[:n_tasks])]),
             "",
         ]
 
@@ -702,6 +793,9 @@ def write_report(
         "learning later tasks. NBT is the mean over all tasks but the last.",
         "- **AUC_k** = (FWT_k + Σ_{t>k} c_{t,k}) / (K − k + 1): average success on task k from the moment "
         "it is learned until the end. AUC is the mean over tasks.",
+        "- **Memory Anchors paper** (App. B.4): FWT_k = c_{k,k} (success right after learning task k), "
+        "NBT_k as above, AUC_k = mean over t ≥ k of c_{t,k} (i.e. AUC_k with c_{k,k} in place of LIBERO's FWT_k). "
+        "SEM = standard error of the mean over tasks.",
         "- **Forgetting_k** = max over t in [k, K−1) of c_{t,k} − c_{K,k}: drop from the peak to the final success.",
         f"- **Confidence intervals**: 95% normal approximation, 1.96·sqrt(p(1−p)/{n_eval}).",
         "",
@@ -713,84 +807,122 @@ def write_report(
     return output_file
 
 
-def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--results_file", required=True, help="path to a LIBERO result.pt")
-    parser.add_argument("--output_dir", required=True, help="directory to save the report and plots into")
-    parser.add_argument("--n_eval", type=int, default=None, help="eval episodes per task, read from config.json if not given (default 20)")
-    parser.add_argument("--eval_every", type=int, default=None, help="epochs between evaluations, read from config.json if not given (default 5)")
-    parser.add_argument("--title", default=None, help="title of the report and plots")
-    args = parser.parse_args()
+def write_run_report(
+    run_dir: str,
+    output_dir: str = None,
+    n_eval: int = None,
+    eval_every: int = None,
+    title: str = None,
+) -> str:
+    """
+    Compute all metrics of a run and write report.md, metrics.json, per_task_metrics.csv
+    and the plots. Partially finished runs are reported for their finished tasks.
+    Args:
+        run_dir: directory containing result.pt (and config.json, task{k}_auc.log)
+        output_dir: directory to write into, default run_dir
+        n_eval: eval episodes per task, read from config.json if not given (default 20)
+        eval_every: epochs between evaluations, read from config.json if not given (default 5)
+        title: title of the report and plots, default "<benchmark> – <algorithm> – <policy>"
 
-    run_dir = os.path.dirname(os.path.abspath(args.results_file))
-    results = load_results(args.results_file)
-    n_tasks = np.asarray(results["S_conf_mat"]).shape[0]
+    Returns:
+    Path of report.md, or None if there is nothing to report yet
+    """
+    output_dir = output_dir or run_dir
+    results_file = os.path.join(run_dir, "result.pt")
+    results = load_results(results_file)
     config = load_config(run_dir)
+    if config is not None and config["lifelong"]["algo"] == "Multitask":
+        print("[warning] reports are not supported for Multitask runs")
+        return None
+    n_tasks_total = np.asarray(results["S_conf_mat"]).shape[0]
+    n_tasks = n_finished_tasks(results, run_dir)
+    if n_tasks == 0:
+        print("[warning] no finished task yet, no report written")
+        return None
+    results = truncate_results(results, n_tasks)
     auc_logs = load_auc_logs(run_dir, n_tasks)
     task_names = load_task_names(config)
 
-    n_eval = args.n_eval or (config["eval"]["n_eval"] if config else 20)
-    eval_every = args.eval_every or (config["eval"]["eval_every"] if config else 5)
+    n_eval = n_eval or (config["eval"]["n_eval"] if config else 20)
+    eval_every = eval_every or (config["eval"]["eval_every"] if config else 5)
+    if title is None and config is not None:
+        title = f"{config['benchmark_name']} – {config['lifelong']['algo']} – {config['policy']['policy_type']}"
     if config is None:
         print("[warning] no config.json next to result.pt, run information is missing")
     if auc_logs is None:
         print("[warning] no task{k}_auc.log files next to result.pt, learning curves are skipped")
 
-    os.makedirs(args.output_dir, exist_ok=True)
+    os.makedirs(output_dir, exist_ok=True)
     metrics = compute_metrics(results, n_eval, auc_logs)
     summary = metrics["summary"]
-    print(f"[info] Forward Transfer: {summary['fwt']:.3f}")
-    print(f"[info] Negative Backward Transfer: {summary['nbt']:.3f}")
-    print(f"[info] AUC: {summary['auc']:.3f}")
+    print(f"[info] FWT {summary['fwt_paper']:.3f} | NBT {summary['nbt_paper']:.3f} | "
+          f"AUC {summary['auc_paper']:.3f} (paper definitions, {n_tasks} of {n_tasks_total} tasks)")
 
     figures = {
         "success_matrix": plot_matrix(
             results["S_conf_mat"],
-            args.output_dir,
+            output_dir,
             "success_matrix.png",
             cmap="Blues",
             colorbar_label="Success rate",
             cell_label=lambda v: f"{int(round(v * n_eval))}/{n_eval}",
             vmin=0.0,
             vmax=1.0,
-            title=args.title,
+            title=title,
         ),
-        "per_task_success": plot_per_task_success(metrics["per_task"], args.output_dir, args.title),
-        "success_over_stages": plot_success_over_stages(metrics["per_task"], args.output_dir, args.title),
-        "task_trajectories": plot_task_trajectories(results, args.output_dir, args.title),
-        "per_task_transfer": plot_per_task_transfer(metrics["per_task"], args.output_dir, args.title),
+        "per_task_success": plot_per_task_success(metrics["per_task"], output_dir, title),
+        "success_over_stages": plot_success_over_stages(metrics["per_task"], output_dir, title),
+        "task_trajectories": plot_task_trajectories(results, output_dir, title),
+        "per_task_transfer": plot_per_task_transfer(metrics["per_task"], output_dir, title),
         "loss_matrix": plot_matrix(
             results["L_conf_mat"],
-            args.output_dir,
+            output_dir,
             "loss_matrix.png",
             cmap="Purples",
             colorbar_label="BC loss",
             cell_label=lambda v: f"{v:.0f}",
-            title=args.title,
+            title=title,
         ),
     }
     if auc_logs is not None:
-        for key in ["success", "loss"]:
+        # no success curves without evaluations during training (last-epoch checkpoints)
+        keys = ["success", "loss"] if all(len(log["success"]) > 0 for log in auc_logs) else ["loss"]
+        for key in keys:
             figures[f"learning_curves_{key}"] = plot_learning_curves(
-                auc_logs, eval_every, key, args.output_dir, args.title
+                auc_logs, eval_every, key, output_dir, title
             )
 
-    with open(os.path.join(args.output_dir, "metrics.json"), "w") as f:
+    with open(os.path.join(output_dir, "metrics.json"), "w") as f:
         json.dump(summary, f, indent=4)
-    write_per_task_csv(metrics["per_task"], args.output_dir)
-    report = write_report(
+    write_per_task_csv(metrics["per_task"], output_dir)
+    return write_report(
         metrics,
         results,
         figures,
-        args.output_dir,
-        args.results_file,
+        output_dir,
+        results_file,
         n_eval,
         eval_every,
         config,
         task_names,
-        args.title,
+        title,
+        n_tasks_total,
     )
-    print(f"[info] wrote report to {report}")
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--results_file", required=True, help="path to a LIBERO result.pt")
+    parser.add_argument("--output_dir", default=None, help="directory to save the report and plots into (default: next to result.pt)")
+    parser.add_argument("--n_eval", type=int, default=None, help="eval episodes per task, read from config.json if not given (default 20)")
+    parser.add_argument("--eval_every", type=int, default=None, help="epochs between evaluations, read from config.json if not given (default 5)")
+    parser.add_argument("--title", default=None, help="title of the report and plots")
+    args = parser.parse_args()
+
+    run_dir = os.path.dirname(os.path.abspath(args.results_file))
+    report = write_run_report(run_dir, args.output_dir, args.n_eval, args.eval_every, args.title)
+    if report is not None:
+        print(f"[info] wrote report to {report}")
 
 
 if __name__ == "__main__":

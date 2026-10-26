@@ -107,7 +107,11 @@ def compute_flops(algo, dataset, cfg):
     return GFLOPs, MParams
 
 
-def create_experiment_dir(cfg):
+def create_experiment_dir(cfg, reuse_latest=False):
+    """
+    Sets cfg.experiment_dir to a new run_XXX directory, or to the latest existing one
+    if reuse_latest (used to resume an unfinished run).
+    """
     prefix = "experiments"
     if cfg.pretrain_model_path != "":
         prefix += "_finetune"
@@ -143,7 +147,8 @@ def create_experiment_dir(cfg):
                 experiment_id = folder_id
         except BaseException:
             pass
-    experiment_id += 1
+    if not (reuse_latest and experiment_id > 0):
+        experiment_id += 1
 
     experiment_dir += f"/run_{experiment_id:03d}"
     cfg.experiment_dir = experiment_dir

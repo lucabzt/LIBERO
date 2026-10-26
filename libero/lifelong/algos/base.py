@@ -1,3 +1,4 @@
+import copy
 import os
 import time
 
@@ -158,6 +159,16 @@ class Sequential(nn.Module, metaclass=AlgoMeta):
         task = benchmark.get_task(task_id)
         task_emb = benchmark.get_task_emb(task_id)
 
+        # best_success: keep the epoch with the highest success on the current task
+        # (evaluated every eval_every epochs); last_epoch: no rollouts, keep the final weights
+        select_best = self.cfg.train.get("checkpoint_selection", "best_success") == "best_success"
+
+        # the per-epoch checkpoint selection may use fewer rollouts than the final evaluation
+        selection_cfg = self.cfg
+        if self.cfg.eval.get("n_eval_during_training") is not None:
+            selection_cfg = copy.deepcopy(self.cfg)
+            selection_cfg.eval.n_eval = self.cfg.eval.n_eval_during_training
+
         # start training
         for epoch in range(0, self.cfg.train.n_epochs + 1):
 
@@ -182,15 +193,16 @@ class Sequential(nn.Module, metaclass=AlgoMeta):
                 f"[info] Epoch: {epoch:3d} | train loss: {training_loss:5.2f} | time: {(t1-t0)/60:4.2f}"
             )
 
-            if epoch % self.cfg.eval.eval_every == 0:  # evaluate BC loss
+            if epoch % self.cfg.eval.eval_every == 0:
+                losses.append(training_loss)
+
+            if select_best and epoch % self.cfg.eval.eval_every == 0:
                 # every eval_every epoch, we evaluate the agent on the current task,
                 # then we pick the best performant agent on the current task as
                 # if it stops learning after that specific epoch. So the stopping
                 # criterion for learning a new task is achieving the peak performance
                 # on the new task. Future work can explore how to decide this stopping
                 # epoch by also considering the agent's performance on old tasks.
-                losses.append(training_loss)
-
                 t0 = time.time()
 
                 task_str = f"k{task_id}_e{epoch//self.cfg.eval.eval_every}"
@@ -198,7 +210,7 @@ class Sequential(nn.Module, metaclass=AlgoMeta):
                     result_summary[task_str] if self.cfg.eval.save_sim_states else None
                 )
                 success_rate = evaluate_one_task_success(
-                    cfg=self.cfg,
+                    cfg=selection_cfg,
                     algo=self,
                     task=task,
                     task_emb=task_emb,
@@ -216,7 +228,7 @@ class Sequential(nn.Module, metaclass=AlgoMeta):
                 t1 = time.time()
 
                 cumulated_counter += 1.0
-                ci = confidence_interval(success_rate, self.cfg.eval.n_eval)
+                ci = confidence_interval(success_rate, selection_cfg.eval.n_eval)
                 tmp_successes = np.array(successes)
                 tmp_successes[idx_at_best_succ:] = successes[idx_at_best_succ]
                 print(
@@ -228,8 +240,11 @@ class Sequential(nn.Module, metaclass=AlgoMeta):
             if self.scheduler is not None and epoch > 0:
                 self.scheduler.step()
 
-        # load the best performance agent on the current task
-        self.policy.load_state_dict(torch_load_model(model_checkpoint_name)[0])
+        if select_best:
+            # load the best performance agent on the current task
+            self.policy.load_state_dict(torch_load_model(model_checkpoint_name)[0])
+        else:
+            torch_save_model(self.policy, model_checkpoint_name, cfg=self.cfg)
 
         # end learning the current task, some algorithms need post-processing
         self.end_task(dataset, task_id, benchmark)
@@ -247,6 +262,9 @@ class Sequential(nn.Module, metaclass=AlgoMeta):
             },
             auc_checkpoint_name,
         )
+
+        if not select_best:
+            return np.nan, losses.mean()
 
         # pretend that the agent stops learning once it reaches the peak performance
         losses[idx_at_best_succ:] = losses[idx_at_best_succ]

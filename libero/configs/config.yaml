@@ -23,3 +23,4 @@ task_embedding_one_hot_offset: 1
 pretrain: false
 pretrain_model_path: ""
 benchmark_name: "LIBERO_SPATIAL"
+resume: false # continue the latest run under the same output path if unfinished (does nothing if finished)

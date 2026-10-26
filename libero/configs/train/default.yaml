@@ -12,6 +12,13 @@ debug: false
 
 use_augmentation: true
 
+# best_success: keep the epoch with the highest success on the current task (LIBERO default,
+# rollouts every eval.eval_every epochs); last_epoch: keep the final weights, no rollouts
+# during training (the evaluation of all seen tasks after each task is unaffected)
+checkpoint_selection: best_success
+# false: keep only the checkpoint of the latest finished task (enough to resume)
+keep_all_checkpoints: true
+
 defaults:
     - optimizer@optimizer: adam_w.yaml
     - scheduler@scheduler: cosine_annealing.yaml

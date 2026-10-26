@@ -3,6 +3,9 @@ eval: true
 batch_size: 64
 num_workers: 4
 n_eval: 20
+# rollouts for the per-epoch checkpoint selection during training (null: n_eval);
+# n_eval is used for the evaluation of all seen tasks after each task
+n_eval_during_training: null
 eval_every: 5
 max_steps: 600
 use_mp: true
