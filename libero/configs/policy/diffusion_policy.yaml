@@ -49,8 +49,12 @@ unet:
   input_pertub: 0.1
   ood_metric: l2
 
+# project the task embedding with language_encoder (MLPEncoder, trained with the policy) before
+# it is concatenated into the global condition, as LIBERO's BC policies do; false: raw embedding
+project_language: true
+
 # BasePolicy builds these augmentations; DiffusionPolicy does not use them (it uses the
-# encoder's random crop). language_encoder only provides the task embedding size.
+# encoder's random crop).
 defaults:
     - data_augmentation@color_aug: batch_wise_img_color_jitter_group_aug.yaml
     - data_augmentation@translation_aug: translation_aug.yaml

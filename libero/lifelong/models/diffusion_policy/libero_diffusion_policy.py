@@ -2,6 +2,7 @@ import torch
 from diffusers.schedulers.scheduling_ddim import DDIMScheduler
 
 from libero.lifelong.models.base_policy import BasePolicy
+from libero.lifelong.models.modules.language_modules import *
 from libero.lifelong.models.diffusion_policy.diffusion_unet_timm_policy import (
     DiffusionUnetTimmPolicy,
 )
@@ -25,7 +26,9 @@ class DiffusionPolicy(BasePolicy):
     conditioned on the first n_obs_steps frames and predicts all actions.
 
     The language embedding is passed to the obs encoder as an extra low-dim
-    obs key, so it is concatenated with the visual and proprio features.
+    obs key, so it is concatenated with the visual and proprio features. With
+    policy.project_language it is first projected by policy.language_encoder
+    (MLPEncoder, as in LIBERO's BC policies), trained with the policy.
     """
 
     def __init__(self, cfg, shape_meta):
@@ -44,6 +47,15 @@ class DiffusionPolicy(BasePolicy):
         self.rgb_keys = list(cfg.data.obs.modality.rgb)
         self.low_dim_keys = list(cfg.data.obs.modality.low_dim)
 
+        # default False: checkpoints from before this option have no projection
+        self.language_encoder = None
+        task_emb_size = policy_cfg.language_encoder.network_kwargs.input_size
+        if policy_cfg.get("project_language", False):
+            self.language_encoder = eval(policy_cfg.language_encoder.network)(
+                **policy_cfg.language_encoder.network_kwargs
+            )
+            task_emb_size = policy_cfg.language_encoder.network_kwargs.output_size
+
         obs_shape_meta = {}
         for key in self.rgb_keys:
             obs_shape_meta[key] = {
@@ -58,7 +70,7 @@ class DiffusionPolicy(BasePolicy):
                 "horizon": self.n_obs_steps,
             }
         obs_shape_meta[TASK_EMB_KEY] = {
-            "shape": [policy_cfg.language_encoder.network_kwargs.input_size],
+            "shape": [task_emb_size],
             "type": "low_dim",
             "horizon": 1,
         }
@@ -114,6 +126,8 @@ class DiffusionPolicy(BasePolicy):
 
     def _dp_obs(self, obs, task_emb):
         dp_obs = {key: obs[key] for key in self.rgb_keys + self.low_dim_keys}
+        if self.language_encoder is not None:
+            task_emb = self.language_encoder({"task_emb": task_emb})
         dp_obs[TASK_EMB_KEY] = task_emb.unsqueeze(1)
         return dp_obs
 
