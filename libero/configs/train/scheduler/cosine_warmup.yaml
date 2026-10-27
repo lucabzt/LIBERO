@@ -1,0 +1,6 @@
+name: cosine_with_warmup
+
+# stepped per batch: linear warmup over warmup_ratio of the steps of a task, then cosine
+# decay to 0 (diffusers get_cosine_schedule_with_warmup, as in the reference diffusion policy)
+kwargs:
+    warmup_ratio: 0.05

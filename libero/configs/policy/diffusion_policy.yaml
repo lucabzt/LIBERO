@@ -42,7 +42,9 @@ obs_encoder:
 unet:
   obs_as_global_cond: true
   diffusion_step_embed_dim: 128
-  down_dims: [256, 512, 1024]
+  # paper App. B.2: "4 encoding and 4 decoding layers" -> 4 levels (ConditionalUnet1D has
+  # len(down_dims) encoder and len(down_dims)-1 decoder levels plus a mid block); widths are a guess
+  down_dims: [128, 256, 512, 1024]
   kernel_size: 5
   n_groups: 8
   cond_predict_scale: true

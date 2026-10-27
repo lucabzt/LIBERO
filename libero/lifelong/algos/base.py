@@ -5,6 +5,7 @@ import time
 import numpy as np
 import robomimic.utils.tensor_utils as TensorUtils
 import torch
+from diffusers.optimization import get_cosine_schedule_with_warmup
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, RandomSampler
@@ -91,13 +92,19 @@ class Sequential(nn.Module, metaclass=AlgoMeta):
             self.policy.parameters(), **self.cfg.train.optimizer.kwargs
         )
 
+        # cosine_with_warmup is stepped per batch and needs the number of steps of the
+        # task, so learn_one_task creates it
         self.scheduler = None
-        if self.cfg.train.scheduler is not None:
+        if self.cfg.train.scheduler is not None and not self._per_step_scheduler():
             self.scheduler = eval(self.cfg.train.scheduler.name)(
                 self.optimizer,
                 T_max=self.cfg.train.n_epochs,
                 **self.cfg.train.scheduler.kwargs,
             )
+
+    def _per_step_scheduler(self):
+        scheduler_cfg = self.cfg.train.scheduler
+        return scheduler_cfg is not None and scheduler_cfg.name == "cosine_with_warmup"
 
     def map_tensor_to_device(self, data):
         """Move data to the device specified by self.cfg.device."""
@@ -146,6 +153,16 @@ class Sequential(nn.Module, metaclass=AlgoMeta):
             persistent_workers=True,
         )
 
+        if self._per_step_scheduler():
+            # as in the reference diffusion policy training: linear warmup over the first
+            # warmup_ratio of the task's steps, then cosine decay to 0 (reset per task)
+            n_steps = self.cfg.train.n_epochs * len(train_dataloader)
+            self.scheduler = get_cosine_schedule_with_warmup(
+                self.optimizer,
+                num_warmup_steps=round(self.cfg.train.scheduler.kwargs.warmup_ratio * n_steps),
+                num_training_steps=n_steps,
+            )
+
         prev_success_rate = -1.0
         best_state_dict = self.policy.state_dict()  # currently save the best model
 
@@ -180,6 +197,8 @@ class Sequential(nn.Module, metaclass=AlgoMeta):
                 for (idx, data) in enumerate(train_dataloader):
                     loss = self.observe(data)
                     training_loss += loss
+                    if self._per_step_scheduler():
+                        self.scheduler.step()
                 training_loss /= len(train_dataloader)
             else:  # just evaluate the zero-shot performance on 0-th epoch
                 training_loss = 0.0
@@ -237,7 +256,7 @@ class Sequential(nn.Module, metaclass=AlgoMeta):
                     flush=True,
                 )
 
-            if self.scheduler is not None and epoch > 0:
+            if self.scheduler is not None and epoch > 0 and not self._per_step_scheduler():
                 self.scheduler.step()
 
         if select_best:
