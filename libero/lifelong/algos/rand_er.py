@@ -14,7 +14,8 @@ class RandER(ER):
 
     Unlike ER (the first n_memories sequences of every past task), the buffer size
     grows with the amount of past data and is not split evenly across tasks.
-    Like ER, every training batch is concatenated with a buffer batch of the same size.
+    Every training batch is concatenated with a buffer batch of replay_ratio times its size
+    (1.0: the same size, as ER).
     """
 
     def start_task(self, task):
@@ -30,10 +31,13 @@ class RandER(ER):
                 f"[info] RandER buffer: {n_memories} of {len(past_data)} past transitions "
                 f"({self.cfg.lifelong.buffer_fraction:.2%})"
             )
+            replay_batch_size = max(
+                1, round(self.cfg.lifelong.get("replay_ratio", 1.0) * self.cfg.train.batch_size)
+            )
             self.buffer = cycle(
                 DataLoader(
                     buf,
-                    batch_size=self.cfg.train.batch_size,
+                    batch_size=replay_batch_size,
                     num_workers=self.cfg.train.num_workers,
                     sampler=RandomSampler(buf),
                     persistent_workers=True,
