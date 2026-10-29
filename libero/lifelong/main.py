@@ -142,6 +142,8 @@ def main(hydra_cfg):
             )
 
     n_tasks = n_manip_tasks // gsz  # number of lifelong learning tasks
+    # tasks trained in this run (max_tasks: stop early, e.g. for short diagnostics)
+    n_tasks_run = n_tasks if cfg.max_tasks is None else min(cfg.max_tasks, n_tasks)
     print("\n=================== Lifelong Benchmark Information  ===================")
     print(f" Name: {benchmark.name}")
     print(f" # Tasks: {n_manip_tasks // gsz}")
@@ -181,9 +183,11 @@ def main(hydra_cfg):
         )
         result_summary = torch_load(result_file)
         n_tasks_done = int(result_summary.get("n_tasks_evaluated", 0))
-        if n_tasks_done >= n_manip_tasks // gsz:
+        if n_tasks_done >= n_tasks_run:
             print(f"[info] {cfg.experiment_dir} is already finished, nothing to resume")
             return
+        # the checkpoints hold the EMA weights, not the raw weights training continues from
+        assert not cfg.train.ema.enabled, "[error] resume is not supported with train.ema"
         print(f"[info] resuming {cfg.experiment_dir} after task {n_tasks_done - 1}")
 
     if cfg.eval.save_sim_states:
@@ -267,7 +271,7 @@ def main(hydra_cfg):
             torch.save(result_summary, os.path.join(cfg.experiment_dir, f"result.pt"))
             save_report(cfg.experiment_dir)
     else:
-        for i in range(n_tasks_done, n_tasks):
+        for i in range(n_tasks_done, n_tasks_run):
             print(f"[info] start training on task {i}")
             algo.train()
 

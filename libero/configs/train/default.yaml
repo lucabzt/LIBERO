@@ -19,6 +19,15 @@ checkpoint_selection: best_success
 # false: keep only the checkpoint of the latest finished task (enough to resume)
 keep_all_checkpoints: true
 
+# evaluate and save an exponential moving average of the weights (diffusion_policy / UMI
+# EMAModel), training continues from the raw weights; needs checkpoint_selection=last_epoch
+ema:
+  enabled: false
+  power: 0.75
+  max_value: 0.9999
+  # false: one EMA carried over all tasks; true: a new EMA at the start of every task
+  reset_per_task: false
+
 defaults:
     - optimizer@optimizer: adam_w.yaml
     - scheduler@scheduler: cosine_annealing.yaml

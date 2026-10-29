@@ -10,6 +10,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, RandomSampler
 
+from libero.lifelong.ema import EMA
 from libero.lifelong.metric import *
 from libero.lifelong.models import *
 from libero.lifelong.utils import *
@@ -75,6 +76,15 @@ class Sequential(nn.Module, metaclass=AlgoMeta):
         self.policy = get_policy_class(cfg.policy.policy_type)(cfg, cfg.shape_meta)
         self.current_task = -1
 
+        # train.ema.enabled: evaluate and save an EMA of the policy weights after each task,
+        # training continues from the raw weights (kept in self.train_state meanwhile)
+        self.ema = None
+        self.train_state = None
+        if self.cfg.train.get("ema", {}).get("enabled", False):
+            assert self.cfg.train.get("checkpoint_selection") == "last_epoch", (
+                "[error] train.ema needs train.checkpoint_selection=last_epoch"
+            )
+
     def end_task(self, dataset, task_id, benchmark, env=None):
         """
         What the algorithm does at the end of learning each lifelong task.
@@ -86,6 +96,14 @@ class Sequential(nn.Module, metaclass=AlgoMeta):
         What the algorithm does at the beginning of learning each lifelong task.
         """
         self.current_task = task
+
+        if self.train_state is not None:
+            # the previous task ended with the EMA weights loaded for evaluation
+            self.policy.load_state_dict(self.train_state)
+            self.train_state = None
+        ema_cfg = self.cfg.train.get("ema", {})
+        if ema_cfg.get("enabled", False) and (self.ema is None or ema_cfg.reset_per_task):
+            self.ema = EMA(self.policy, power=ema_cfg.power, max_value=ema_cfg.max_value)
 
         # initialize the optimizer and scheduler
         self.optimizer = eval(self.cfg.train.optimizer.name)(
@@ -197,6 +215,8 @@ class Sequential(nn.Module, metaclass=AlgoMeta):
                 for (idx, data) in enumerate(train_dataloader):
                     loss = self.observe(data)
                     training_loss += loss
+                    if self.ema is not None:
+                        self.ema.step()
                     if self._per_step_scheduler():
                         self.scheduler.step()
                 training_loss /= len(train_dataloader)
@@ -263,6 +283,9 @@ class Sequential(nn.Module, metaclass=AlgoMeta):
             # load the best performance agent on the current task
             self.policy.load_state_dict(torch_load_model(model_checkpoint_name)[0])
         else:
+            if self.ema is not None:
+                self.train_state = copy.deepcopy(self.policy.state_dict())
+                self.ema.copy_to_model()
             torch_save_model(self.policy, model_checkpoint_name, cfg=self.cfg)
 
         # end learning the current task, some algorithms need post-processing
