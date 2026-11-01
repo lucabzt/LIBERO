@@ -36,4 +36,7 @@ obs_key_mapping:
 # action related
 affine_translate: 4
 action_scale: 1.0
-train_dataset_ratio: 0.8
+train_dataset_ratio: 0.8 # unused
+# demos held out of every task's training data (the last ones by demo index), e.g. for the
+# disagreement baseline of AnchorER; 0: train on all demos
+n_val_demos: 0

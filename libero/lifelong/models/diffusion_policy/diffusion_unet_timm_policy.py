@@ -41,6 +41,20 @@ def rotation_6d_to_matrix(d6: torch.Tensor) -> torch.Tensor:
     b3 = torch.cross(b1, b2, dim=-1)
     return torch.stack((b1, b2, b3), dim=-2)
 
+def axis_angle_to_matrix(axis_angle: torch.Tensor) -> torch.Tensor:
+    """
+    LIBERO: Rodrigues' formula, axis-angle (*, 3) -> rotation matrices (*, 3, 3).
+    """
+    angle = torch.norm(axis_angle, dim=-1, keepdim=True)
+    axis = axis_angle / angle.clamp(min=1e-8)
+    x, y, z = axis.unbind(-1)
+    zeros = torch.zeros_like(x)
+    K = torch.stack((zeros, -z, y, z, zeros, -x, -y, x, zeros), dim=-1).view(*axis.shape[:-1], 3, 3)
+    eye = torch.eye(3, dtype=axis_angle.dtype, device=axis_angle.device).expand_as(K)
+    sin = torch.sin(angle)[..., None]
+    cos = torch.cos(angle)[..., None]
+    return eye + sin * K + (1 - cos) * (K @ K)
+
 def so3_distance(R1, R2):
     """
     Geodesic distance between two rotations.
@@ -108,7 +122,10 @@ class DiffusionUnetTimmPolicy(BaseImagePolicy):
                 role = 'pos'
             elif 'rot' in ctype:
                 role = 'rot'
-                if ood_metric == 'se3':
+                # LIBERO: 'rot_axis_angle' (size 3) for delta axis-angle actions, otherwise rot6d
+                if 'axis_angle' in ctype:
+                    assert csize == 3, f"Expected axis-angle size 3 for component {ctype}, got {csize}"
+                elif ood_metric == 'se3':
                     assert csize == 6, f"Expected rot6d size 6 for component {ctype}, got {csize}"
             elif 'gripper' in ctype:
                 role = 'gripper'
@@ -314,10 +331,17 @@ class DiffusionUnetTimmPolicy(BaseImagePolicy):
             except Exception:
                 pass
 
-    def compute_ood_score(self, batch, noise_level, do_stop = False):
-        # in: batch 
-        # out: OOD score per batch element 
-        # do_stop is a debugging technique 
+    def compute_ood_score(self, batch, noise_level, do_stop = False, ood_metric = None,
+            num_inference_steps = None, action_scale = None):
+        # in: batch
+        # out: OOD score per batch element
+        # do_stop is a debugging technique
+        # LIBERO: ood_metric overrides self.ood_metric, num_inference_steps the DDIM steps of the
+        # denoising (default: the rollout steps), action_scale (per action dim) multiplies the
+        # unnormalized actions before the distance, e.g. controller inputs -> metres / radians
+        ood_metric = self.ood_metric if ood_metric is None else ood_metric
+        if num_inference_steps is None:
+            num_inference_steps = self.num_inference_steps
 
         # this function is an implementation of checking if something is in or out of distribution
         # it adds the specified noise to the batch, then denoises it again and returns the denoised actions 
@@ -345,21 +369,26 @@ class DiffusionUnetTimmPolicy(BaseImagePolicy):
 
             noisy_trajectory_original = noisy_trajectory.clone() # for graphing DEBUG
             scheduler = self.noise_scheduler
-            scheduler.set_timesteps(self.num_inference_steps)
+            scheduler.set_timesteps(num_inference_steps)
             start_index = (scheduler.timesteps >= noise_level).nonzero()[-1][0]
-            for t in scheduler.timesteps[start_index:]: # this goes from high to low 
-                model_output = self.model(noisy_trajectory, t, 
+            for t in scheduler.timesteps[start_index:]: # this goes from high to low
+                model_output = self.model(noisy_trajectory, t,
                     local_cond=None, global_cond=global_cond)
                 noisy_trajectory = scheduler.step(
-                    model_output, t, noisy_trajectory, 
+                    model_output, t, noisy_trajectory,
                     generator=None,
                     **self.kwargs
                     ).prev_sample
-        
+
             noisy_trajectory_unnorm = self.normalizer['action'].unnormalize(noisy_trajectory).cpu()
             trajectory_unnorm = batch['action'].cpu()  # This is already unnormalized
 
-        if self.ood_metric == 'l2':
+        if action_scale is not None:
+            action_scale = torch.as_tensor(action_scale, dtype=trajectory_unnorm.dtype)
+            noisy_trajectory_unnorm = noisy_trajectory_unnorm * action_scale
+            trajectory_unnorm = trajectory_unnorm * action_scale
+
+        if ood_metric == 'l2':
             return torch.norm((noisy_trajectory_unnorm - trajectory_unnorm).flatten(start_dim=1), dim=1)
 
         # N x T x D -> N X T X 3 -> N X 3T
@@ -386,9 +415,10 @@ class DiffusionUnetTimmPolicy(BaseImagePolicy):
             elif role == 'rot':
                 pred_flat = noisy_trajectory_unnorm[..., start:end].reshape(N * T, end - start)
                 gt_flat = trajectory_unnorm[..., start:end].reshape(N * T, end - start)
+                to_matrix = axis_angle_to_matrix if end - start == 3 else rotation_6d_to_matrix
                 d_rot = so3_distance(
-                    rotation_6d_to_matrix(pred_flat),
-                    rotation_6d_to_matrix(gt_flat),
+                    to_matrix(pred_flat),
+                    to_matrix(gt_flat),
                 ).view(N, T)
                 d_rot_terms.append(torch.mean(d_rot, dim=1))  # (N,)
             elif role == 'gripper':

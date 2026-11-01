@@ -1,0 +1,42 @@
+algo: AnchorER
+# buffer size and replay as RandER (paper Table 4: 1% of all past data, resampled every task)
+buffer_fraction: 0.01
+# fixed buffer size instead of buffer_fraction (e.g. 1000 for the removal experiment, Table 3)
+n_memories: null
+replay_ratio: 1.0
+
+# add: anchor_fraction of the buffer are the best anchors, the rest uniform (Table 4: 0.1 / 0.2)
+# remove: exclude the best remove_fraction of all past data, then sample uniformly (Table 3)
+mode: add
+anchor_fraction: 0.1
+remove_fraction: 0.1
+
+# step 1 (observation overlap) and step 2 (action disagreement); disabling step 2 is the
+# paper's "Ours-ActionDis" ablation, disabling both the plain nearest-neighbor baseline
+use_overlap: true
+use_disagreement: true
+
+# obs-encoder features used for the distances (null: all modalities, i.e. rgb, low-dim and
+# the task embedding), every dimension z-scored with the past-data stats
+representation_keys: null
+kmeans_n_init: 20
+
+# step 2 needs held-out demos: set data.n_val_demos (e.g. 2) for the mu / sigma baseline.
+# The action chunk is noised to step noise_level and denoised with
+# disagreement_inference_steps DDIM steps (paper: step 20 of a 100-step DDIM schedule)
+noise_level: 20
+disagreement_inference_steps: 100
+n_noise_samples: 1
+std_cutoff: 2.0
+# l2: ||a_hat - a||_2 over the unnormalized chunk incl. gripper (paper Alg. 1)
+# se3: authors' code, mean position error + 0.1 * mean rotation geodesic, no gripper, after
+#      action_scale (OSC_POSE controller limits: inputs -> metres / radians)
+disagreement_metric: se3
+action_scale: [0.05, 0.05, 0.05, 0.5, 0.5, 0.5, 1.0]
+
+# step 3: median distance to the n_neighbors nearest disagreeing new samples
+n_neighbors: 10
+
+# batch size and device (latents, distances) of the selection passes
+selection_batch_size: 128
+selection_device: cuda

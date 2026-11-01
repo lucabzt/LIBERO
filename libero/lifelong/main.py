@@ -26,6 +26,7 @@ from libero.lifelong.datasets import (
     SequenceVLDataset,
     get_dataset,
     get_normalizer_stats,
+    split_demos,
 )
 from libero.lifelong.metric import evaluate_loss, evaluate_success
 from libero.lifelong.report.interpret_results import write_run_report
@@ -42,7 +43,7 @@ from libero.lifelong.utils import (
 
 
 # algorithms whose state after a task is fully given by the policy checkpoint and end_task
-RESUMABLE_ALGOS = ["Sequential", "SingleTask", "ER", "RandER"]
+RESUMABLE_ALGOS = ["Sequential", "SingleTask", "ER", "RandER", "AnchorER"]
 
 
 def save_report(experiment_dir):
@@ -84,21 +85,37 @@ def main(hydra_cfg):
 
     # prepare datasets from the benchmark
     manip_datasets = []
+    # held-out demos of every task (data.n_val_demos), None entries without
+    val_manip_datasets = []
     descriptions = []
     shape_meta = None
+    n_val_demos = cfg.data.get("n_val_demos", 0)
 
     for i in range(n_manip_tasks):
         # currently we assume tasks from same benchmark have the same shape_meta
         try:
+            dataset_path = os.path.join(cfg.folder, benchmark.get_task_demonstration(i))
+            train_demos = None
+            if n_val_demos > 0:
+                train_demos, val_demos = split_demos(dataset_path, n_val_demos)
             task_i_dataset, shape_meta = get_dataset(
-                dataset_path=os.path.join(
-                    cfg.folder, benchmark.get_task_demonstration(i)
-                ),
+                dataset_path=dataset_path,
                 obs_modality=cfg.data.obs.modality,
                 initialize_obs_utils=(i == 0),
                 seq_len=cfg.data.seq_len,
                 frame_stack=cfg.data.frame_stack,
+                demos=train_demos,
             )
+            task_i_val_dataset = None
+            if n_val_demos > 0:
+                task_i_val_dataset, _ = get_dataset(
+                    dataset_path=dataset_path,
+                    obs_modality=cfg.data.obs.modality,
+                    initialize_obs_utils=False,
+                    seq_len=cfg.data.seq_len,
+                    frame_stack=cfg.data.frame_stack,
+                    demos=val_demos,
+                )
         except Exception as e:
             print(
                 f"[error] failed to load task {i} name {benchmark.get_task_names()[i]}"
@@ -109,6 +126,7 @@ def main(hydra_cfg):
         task_description = benchmark.get_task(i).language
         descriptions.append(task_description)
         manip_datasets.append(task_i_dataset)
+        val_manip_datasets.append(task_i_val_dataset)
 
     task_embs = get_task_embs(cfg, descriptions)
     benchmark.set_task_embs(task_embs)
@@ -122,9 +140,15 @@ def main(hydra_cfg):
             SequenceVLDataset(ds, emb.clone())
             for (ds, emb) in zip(manip_datasets, task_embs)
         ]
+        val_datasets = [
+            None if ds is None else SequenceVLDataset(ds, emb.clone())
+            for (ds, emb) in zip(val_manip_datasets, task_embs)
+        ]
         n_demos = [data.n_demos for data in datasets]
         n_sequences = [data.total_num_sequences for data in datasets]
     else:  # group gsz manipulation tasks into a lifelong task, currently not used
+        assert n_val_demos == 0, "[error] data.n_val_demos needs task_group_size 1"
+        val_datasets = [None] * (n_manip_tasks // gsz)
         assert (
             n_manip_tasks % gsz == 0
         ), f"[error] task_group_size does not divide n_tasks"
@@ -153,6 +177,8 @@ def main(hydra_cfg):
             print(f"        {benchmark.get_task(i*gsz+j).language}")
     print(" # demonstrations: " + " ".join(f"({x})" for x in n_demos))
     print(" # sequences: " + " ".join(f"({x})" for x in n_sequences))
+    if n_val_demos > 0:
+        print(f" # held-out demonstrations per task: {n_val_demos}")
     print("=======================================================================\n")
 
     # prepare experiment and update the config
@@ -205,6 +231,8 @@ def main(hydra_cfg):
 
     # define lifelong algorithm
     algo = safe_device(get_algo_class(cfg.lifelong.algo)(n_tasks, cfg), cfg.device)
+    # held-out demos of every lifelong task (None entries without data.n_val_demos)
+    algo.val_datasets = val_datasets
     if cfg.pretrain_model_path != "":  # load a pretrained model if there is any
         try:
             algo.policy.load_state_dict(torch_load_model(cfg.pretrain_model_path)[0])

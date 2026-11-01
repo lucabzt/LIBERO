@@ -149,6 +149,31 @@ class DiffusionPolicy(BasePolicy):
         return self.dp.compute_loss(self._dp_batch(data), reduce_loss=(reduction == "mean"))
 
     @torch.no_grad()
+    def compute_obs_representations(self, data):
+        """
+        Obs-encoder features of a training batch, {obs key: (B, D_key)}: the per-key parts
+        of the global condition (rgb, low-dim and task embedding), used by AnchorER.
+        """
+        return self.dp.compute_obs_representations(self._dp_batch(data), return_as_dict=True)
+
+    @torch.no_grad()
+    def compute_action_disagreement(
+        self, data, noise_level, ood_metric=None, num_inference_steps=None, action_scale=None
+    ):
+        """
+        Noise-denoise action disagreement of a training batch, (B,): the action chunk is
+        noised to step noise_level and denoised with the policy, then compared to the label
+        (DiffusionUnetTimmPolicy.compute_ood_score, Memory Anchors Alg. 1 step 2).
+        """
+        return self.dp.compute_ood_score(
+            self._dp_batch(data),
+            noise_level=noise_level,
+            ood_metric=ood_metric,
+            num_inference_steps=num_inference_steps,
+            action_scale=action_scale,
+        )
+
+    @torch.no_grad()
     def get_action(self, data):
         """
         Called once per env step with obs of shape (B, ...). Keeps the last

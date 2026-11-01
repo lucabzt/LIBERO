@@ -14,7 +14,18 @@ class SequenceDataset(_RobomimicSequenceDataset):
     Picklable for DataLoader workers under the 'spawn' start method: drops the open
     h5py handle (robomimic reopens it lazily on first access) and carries robomimic's
     global obs spec along, since a spawned worker starts with it uninitialized.
+
+    demos: optional list of demo keys (e.g. "demo_0") to load instead of all demos.
     """
+
+    def __init__(self, *args, demos=None, **kwargs):
+        self._demos = demos
+        super().__init__(*args, **kwargs)
+
+    def load_demo_info(self, filter_by_attribute=None, demos=None):
+        if demos is None:
+            demos = self._demos
+        super().load_demo_info(filter_by_attribute=filter_by_attribute, demos=demos)
 
     def __getstate__(self):
         state = self.__dict__.copy()
@@ -45,6 +56,7 @@ def get_dataset(
     frame_stack=1,
     filter_key=None,
     hdf5_cache_mode="low_dim",
+    demos=None,
     *args,
     **kwargs
 ):
@@ -76,8 +88,23 @@ def get_dataset(
         hdf5_use_swmr=False,
         hdf5_normalize_obs=None,
         filter_by_attribute=filter_key,  # can optionally provide a filter key here
+        demos=demos,
     )
     return dataset, shape_meta
+
+
+def split_demos(dataset_path, n_val_demos):
+    """
+    Demo keys of an hdf5 dataset split into (train, validation): the last n_val_demos
+    demos (by demo index) are held out.
+    """
+    with h5py.File(dataset_path, "r") as f:
+        demos = sorted(f["data"].keys(), key=lambda d: int(d[5:]))
+    assert 0 <= n_val_demos < len(demos), (
+        f"[error] cannot hold out {n_val_demos} of {len(demos)} demos"
+    )
+    n_train = len(demos) - n_val_demos
+    return demos[:n_train], demos[n_train:]
 
 
 def get_normalizer_stats(sequence_datasets, low_dim_keys):
