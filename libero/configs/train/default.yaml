@@ -16,8 +16,9 @@ use_augmentation: true
 # rollouts every eval.eval_every epochs); last_epoch: keep the final weights, no rollouts
 # during training (the evaluation of all seen tasks after each task is unaffected)
 checkpoint_selection: best_success
-# false: keep only the checkpoint of the latest finished task (enough to resume)
-keep_all_checkpoints: true
+# false: keep only the checkpoint of the latest finished task (enough to resume); set true
+# only for runs whose per-task checkpoints are needed (e.g. policy videos before / after a conflict)
+keep_all_checkpoints: false
 
 # evaluate and save an exponential moving average of the weights (diffusion_policy / UMI
 # EMAModel), training continues from the raw weights; needs checkpoint_selection=last_epoch
