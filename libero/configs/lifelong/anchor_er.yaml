@@ -16,9 +16,11 @@ remove_fraction: 0.1
 use_overlap: true
 use_disagreement: true
 
-# obs-encoder features used for the distances (null: all modalities, i.e. rgb, low-dim and
-# the task embedding), every dimension z-scored with the past-data stats
-representation_keys: null
+# obs-encoder features used for the distances (null: all modalities incl. the task embedding),
+# every dimension z-scored with the past-data stats. The task embedding is left out: it is
+# constant within a task, so with few past tasks its z-scores explode (std of 2 values per dim)
+# and its distance swamps the visual / proprio part (smoke test 2026-11-01, task 3)
+representation_keys: [agentview_rgb, eye_in_hand_rgb, gripper_states, joint_states]
 kmeans_n_init: 20
 
 # step 2 needs held-out demos: set data.n_val_demos (e.g. 2) for the mu / sigma baseline.
