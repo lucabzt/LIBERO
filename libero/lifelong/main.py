@@ -30,6 +30,7 @@ from libero.lifelong.datasets import (
 )
 from libero.lifelong.metric import evaluate_loss, evaluate_success
 from libero.lifelong.report.interpret_results import write_run_report
+from libero.lifelong.report.anchor_er_report import write_anchor_er_report
 from libero.libero.utils.torch_utils import torch_load
 from libero.lifelong.utils import (
     NpEncoder,
@@ -54,6 +55,14 @@ def save_report(experiment_dir):
             print(f"[info] wrote {report}")
     except Exception as e:
         print(f"[warning] could not write the report: {e!r}")
+    # AnchorER runs: selection statistics in anchorER/report.md
+    if os.path.isdir(os.path.join(experiment_dir, "anchorER")):
+        try:
+            report = write_anchor_er_report(experiment_dir)
+            if report is not None:
+                print(f"[info] wrote {report}")
+        except Exception as e:
+            print(f"[warning] could not write the AnchorER report: {e!r}")
 
 
 @hydra.main(config_path="../configs", config_name="config", version_base=None)

@@ -8,6 +8,7 @@ from torch.utils.data import ConcatDataset, DataLoader, Subset
 
 from libero.lifelong.algos.anchor_er import selection, visualization
 from libero.lifelong.algos.rand_er import RandER
+from libero.lifelong.report.anchor_er_report import selection_percentages
 
 
 class AnchorER(RandER):
@@ -30,7 +31,8 @@ class AnchorER(RandER):
     with the best scores is excluded before sampling the buffer uniformly (Sec. 5.1).
     Training is RandER's (concatenated replay batches).
 
-    Selection results and plots are written to <experiment_dir>/anchor_er/task<k>/.
+    Selection results and plots are written to <experiment_dir>/anchorER/task<k>/; main.py
+    summarizes them in anchorER/report.md (libero/lifelong/report/anchor_er_report.py).
     """
 
     def __init__(self, n_tasks, cfg, **policy_kwargs):
@@ -47,7 +49,7 @@ class AnchorER(RandER):
         return super().learn_one_task(dataset, task_id, benchmark, result_summary)
 
     def select_buffer(self, past_data, n_memories, rng):
-        out_dir = os.path.join(self.experiment_dir, "anchor_er", f"task{self.current_task}")
+        out_dir = os.path.join(self.experiment_dir, "anchorER", f"task{self.current_task}")
         os.makedirs(out_dir, exist_ok=True)
         self.policy.eval()
         try:
@@ -178,6 +180,8 @@ class AnchorER(RandER):
             raise ValueError(f"[error] unknown AnchorER mode {cfg.mode}")
         timings["anchors"] = time.time() - t0
         info["n_anchors"] = int(len(anchors))
+        info["n_buffer"] = int(len(indices))
+        info["mode"] = cfg.mode
         info["timings_s"] = timings
 
         self._log_selection(
@@ -186,8 +190,12 @@ class AnchorER(RandER):
         )
         print(
             f"[info] AnchorER task {task + 1}: {info['n_overlap']}/{info['n_new']} new samples "
-            f"overlap, {info['n_disagreement']} disagree, {info['n_anchors']} anchors "
-            f"({cfg.mode}), {sum(timings.values()) / 60:.1f} min"
+            f"overlap ({info['overlap_pct']:.1f}%), {info['n_disagreement']} disagree "
+            f"({info['disagreement_pct_of_overlap']:.1f}% of overlap, "
+            f"{info['disagreement_pct_of_new']:.1f}% of new), {info['n_anchors']} anchors "
+            f"({cfg.mode}, {info['anchor_pct_of_buffer' if cfg.mode == 'add' else 'anchor_pct_of_old']:.1f}% "
+            f"of the {'buffer' if cfg.mode == 'add' else 'past data'}), "
+            f"{sum(timings.values()) / 60:.1f} min"
         )
         return indices
 
@@ -215,6 +223,8 @@ class AnchorER(RandER):
         task_names = [self.benchmark.get_task(k).language for k in range(self.current_task)]
         info["anchors_per_task"] = np.bincount(old_task[anchors], minlength=len(task_names)).tolist()
         info["buffer_per_task"] = np.bincount(old_task[indices], minlength=len(task_names)).tolist()
+        info["old_per_task"] = np.bincount(old_task, minlength=len(task_names)).tolist()
+        info.update(selection_percentages(info))
         info["past_tasks"] = task_names
         info["new_task"] = self.benchmark.get_task(self.current_task).language
         with open(os.path.join(out_dir, "selection.json"), "w") as f:
