@@ -19,6 +19,8 @@ output_dir: null # use default path (./experiments*)
 load_previous_model: false
 device: "cuda"
 task_embedding_format: "bert"
+# subtract the mean embedding over the benchmark's task instructions (all tasks of the suite)
+center_task_embs: false
 task_embedding_one_hot_offset: 1
 pretrain: false
 pretrain_model_path: ""

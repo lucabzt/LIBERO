@@ -224,5 +224,9 @@ def get_task_embs(cfg, descriptions):
             return_tensors="pt",  # ask the function to return PyTorch tensors
         )
         task_embs = model(**tokens)["pooler_output"].detach()
+    if cfg.get("center_task_embs", False):
+        # subtract the mean embedding of the suite's instructions: removes the direction all of
+        # them share, so similar instructions are further apart
+        task_embs = task_embs - task_embs.mean(dim=0, keepdim=True)
     cfg.policy.language_encoder.network_kwargs.input_size = task_embs.shape[-1]
     return task_embs
