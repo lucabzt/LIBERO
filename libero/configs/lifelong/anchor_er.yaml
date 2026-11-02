@@ -21,6 +21,9 @@ use_disagreement: true
 # constant within a task, so with few past tasks its z-scores explode (std of 2 values per dim)
 # and its distance swamps the visual / proprio part (smoke test 2026-11-01, task 3)
 representation_keys: [agentview_rgb, eye_in_hand_rgb, gripper_states, joint_states]
+# zscore: every dimension z-scored with the past-data stats (authors' individually_normalized
+# path); none: the features concatenated raw (authors' use_select_keys path)
+representation_normalization: zscore
 kmeans_n_init: 20
 
 # step 2 needs held-out demos: set data.n_val_demos (e.g. 2) for the mu / sigma baseline.

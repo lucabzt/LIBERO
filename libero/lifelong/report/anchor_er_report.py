@@ -268,7 +268,8 @@ def write_anchor_er_report(run_dir: str) -> str:
 
     params = [
         "mode", "anchor_fraction", "remove_fraction", "buffer_fraction", "n_memories",
-        "use_overlap", "use_disagreement", "representation_keys", "disagreement_metric",
+        "use_overlap", "use_disagreement", "representation_keys", "representation_normalization",
+        "disagreement_metric",
         "noise_level", "disagreement_inference_steps", "n_noise_samples", "std_cutoff",
         "n_neighbors",
     ]

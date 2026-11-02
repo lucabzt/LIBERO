@@ -111,8 +111,13 @@ class AnchorER(RandER):
         old_reprs = self._representations(past_data)
         new_reprs = self._representations(self.current_dataset)
         keys = cfg.representation_keys or list(old_reprs.keys())
-        old, stats = selection.normalize_representations(old_reprs, keys)
-        new, _ = selection.normalize_representations(new_reprs, keys, stats)
+        if cfg.get("representation_normalization", "zscore") == "zscore":
+            old, stats = selection.normalize_representations(old_reprs, keys)
+            new, _ = selection.normalize_representations(new_reprs, keys, stats)
+        else:
+            # "none": the features concatenated as they are (authors' use_select_keys path)
+            old = torch.cat([old_reprs[key] for key in keys], dim=1)
+            new = torch.cat([new_reprs[key] for key in keys], dim=1)
         info["representation_dims"] = {key: old_reprs[key].shape[1] for key in keys}
         del old_reprs, new_reprs
         timings["representations"] = time.time() - t0
