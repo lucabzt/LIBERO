@@ -12,6 +12,9 @@ class RandER(ER):
     buffer_fraction * (number of past transitions) transitions, sampled uniformly
     without replacement from all past tasks, and is resampled at every new task.
     lifelong.n_memories (if set) is a fixed buffer size instead.
+    lifelong.buffer_indices_file (if set): a .npy of indices into the past data (all past tasks
+    concatenated, as ConcatDataset) used as the buffer instead of select_buffer, e.g. for
+    controlled single-task interventions with a fixed, precomputed buffer.
 
     Unlike ER (the first n_memories sequences of every past task), the buffer size
     grows with the amount of past data and is not split evenly across tasks.
@@ -29,7 +32,16 @@ class RandER(ER):
                 n_memories = max(1, round(self.cfg.lifelong.buffer_fraction * len(past_data)))
             assert n_memories <= len(past_data), "[error] buffer larger than the past data"
             rng = np.random.default_rng(self.cfg.seed + task)
-            indices = self.select_buffer(past_data, n_memories, rng)
+            indices_file = self.cfg.lifelong.get("buffer_indices_file")
+            if indices_file:
+                indices = np.load(indices_file).astype(np.int64)
+                assert len(np.unique(indices)) == len(indices) and indices.min() >= 0 and indices.max() < len(past_data), (
+                    f"[error] invalid buffer indices in {indices_file}"
+                )
+                n_memories = len(indices)
+                print(f"[info] buffer indices from {indices_file}")
+            else:
+                indices = self.select_buffer(past_data, n_memories, rng)
             buf = Subset(past_data, indices.tolist())
             print(
                 f"[info] {self.cfg.lifelong.algo} buffer: {n_memories} of {len(past_data)} "

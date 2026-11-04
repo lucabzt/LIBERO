@@ -6,3 +6,6 @@ n_memories: null
 # replay samples per current-task sample in every training batch (the paper does not state it;
 # 1.0 = ER's 1:1 concatenation)
 replay_ratio: 1.0
+# .npy of indices into the past data (all past tasks concatenated) used as the buffer instead of
+# the uniform draw, e.g. a fixed buffer for controlled interventions; null: uniform draw
+buffer_indices_file: null
