@@ -13,3 +13,6 @@ buffer_indices_file: null
 # always full replay batches); false: cycle() over a RandomSampler (restarts every buffer pass,
 # last batch of every pass smaller), as in the runs before 2026-11-05
 continuous_replay_loader: false
+# true: latent replay (MLR): the buffer holds the frozen obs encoder's features (the U-Net's global
+# condition, center crop) and the action chunks instead of raw obs; needs policy.freeze_obs_encoder
+latent_replay: false

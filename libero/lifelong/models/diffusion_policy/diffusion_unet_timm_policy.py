@@ -584,6 +584,34 @@ class DiffusionUnetTimmPolicy(BaseImagePolicy):
 
 
 
+    def compute_loss_from_global_cond(self, global_cond, nactions, reduce_loss=True):
+        """
+        LIBERO (latent replay): the diffusion loss of compute_loss for precomputed obs-encoder
+        features global_cond (B, D) and normalized actions nactions (B, horizon, action_dim), with
+        the same noise / input perturbation / timestep sampling as compute_loss.
+        """
+        assert self.train_diffusion_n_samples == 1
+        noise = torch.randn(nactions.shape, device=nactions.device)
+        noise_new = noise + self.input_pertub * torch.randn(nactions.shape, device=nactions.device)
+        timesteps = torch.randint(
+            0, self.noise_scheduler.config.num_train_timesteps,
+            (nactions.shape[0],), device=nactions.device
+        ).long()
+        noisy_trajectory = self.noise_scheduler.add_noise(nactions, noise_new, timesteps)
+        pred = self.model(noisy_trajectory, timesteps, local_cond=None, global_cond=global_cond)
+        pred_type = self.noise_scheduler.config.prediction_type
+        if pred_type == 'epsilon':
+            target = noise
+        elif pred_type == 'sample':
+            target = nactions
+        else:
+            raise ValueError(f"Unsupported prediction type {pred_type}")
+        loss = F.mse_loss(pred, target, reduction='none')
+        loss = reduce(loss, 'b ... -> b (...)', 'mean')
+        if reduce_loss:
+            loss = loss.mean()
+        return loss
+
     def forward(self, batch, return_intermediates = False, parallel_intermediates = None, reduce_loss = True):
         # return intermediates: return intermediate representations (might be customized later)
         # noise: supplied noise seed for parallel runs (needed for u-net regularization)

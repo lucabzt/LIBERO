@@ -45,3 +45,8 @@ n_neighbors: 10
 # batch size and device (latents, distances) of the selection passes
 selection_batch_size: 128
 selection_device: cuda
+# true: latent replay (MLR): the buffer holds the frozen obs encoder's features (the U-Net's global
+# condition, center crop) and the action chunks instead of raw obs; needs policy.freeze_obs_encoder
+latent_replay: false
+# replay DataLoader as in rand_er.yaml (true: endless random permutations, always full batches)
+continuous_replay_loader: false

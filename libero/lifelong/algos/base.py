@@ -1,4 +1,5 @@
 import copy
+import json
 import os
 import time
 
@@ -106,8 +107,10 @@ class Sequential(nn.Module, metaclass=AlgoMeta):
             self.ema = EMA(self.policy, power=ema_cfg.power, max_value=ema_cfg.max_value)
 
         # initialize the optimizer and scheduler
+        # frozen parameters (e.g. policy.freeze_obs_encoder) are left out
         self.optimizer = eval(self.cfg.train.optimizer.name)(
-            self.policy.parameters(), **self.cfg.train.optimizer.kwargs
+            [p for p in self.policy.parameters() if p.requires_grad],
+            **self.cfg.train.optimizer.kwargs,
         )
 
         # cosine_with_warmup is stepped per batch and needs the number of steps of the
@@ -204,6 +207,11 @@ class Sequential(nn.Module, metaclass=AlgoMeta):
             selection_cfg = copy.deepcopy(self.cfg)
             selection_cfg.eval.n_eval = self.cfg.eval.n_eval_during_training
 
+        # compute cost of the task's training (written to task<k>_cost.json)
+        cost = {"train_time_s": 0.0, "n_steps": 0}
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats()
+
         # start training
         for epoch in range(0, self.cfg.train.n_epochs + 1):
 
@@ -220,6 +228,8 @@ class Sequential(nn.Module, metaclass=AlgoMeta):
                     if self._per_step_scheduler():
                         self.scheduler.step()
                 training_loss /= len(train_dataloader)
+                cost["train_time_s"] += time.time() - t0
+                cost["n_steps"] += len(train_dataloader)
             else:  # just evaluate the zero-shot performance on 0-th epoch
                 training_loss = 0.0
                 for (idx, data) in enumerate(train_dataloader):
@@ -287,6 +297,14 @@ class Sequential(nn.Module, metaclass=AlgoMeta):
                 self.train_state = copy.deepcopy(self.policy.state_dict())
                 self.ema.copy_to_model()
             torch_save_model(self.policy, model_checkpoint_name, cfg=self.cfg)
+
+        cost["n_trainable_params"] = sum(p.numel() for p in self.policy.parameters() if p.requires_grad)
+        cost["n_params"] = sum(p.numel() for p in self.policy.parameters())
+        if torch.cuda.is_available():
+            cost["peak_gpu_mem_gb"] = torch.cuda.max_memory_allocated() / 1e9
+        cost.update(getattr(self, "replay_cost", {}))
+        with open(os.path.join(self.experiment_dir, f"task{task_id}_cost.json"), "w") as f:
+            json.dump(cost, f, indent=2)
 
         # end learning the current task, some algorithms need post-processing
         self.end_task(dataset, task_id, benchmark)

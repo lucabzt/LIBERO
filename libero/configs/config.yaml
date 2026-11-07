@@ -24,6 +24,10 @@ center_task_embs: false
 task_embedding_one_hot_offset: 1
 pretrain: false
 pretrain_model_path: ""
+# the first pretrain_n_tasks tasks of the order were learned by pretrain_model_path (Multitask with
+# max_tasks=pretrain_n_tasks): they count as finished lifelong tasks (ER-style algorithms keep their
+# data for replay), the lifelong stage starts at task pretrain_n_tasks
+pretrain_n_tasks: 0
 benchmark_name: "LIBERO_SPATIAL"
 max_tasks: null # stop after this many lifelong tasks (null: all)
 resume: false # continue the latest run under the same output path if unfinished (does nothing if finished)

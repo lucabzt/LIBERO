@@ -148,6 +148,54 @@ class DiffusionPolicy(BasePolicy):
     def compute_loss(self, data, reduction="mean"):
         return self.dp.compute_loss(self._dp_batch(data), reduce_loss=(reduction == "mean"))
 
+    def freeze_obs_encoder(self):
+        """
+        Freeze the obs encoder (ResNets of both cameras and the spatial embedding; low-dim obs and
+        the raw task embedding pass through it without parameters), e.g. after multitask
+        pretraining: only the U-Net (and the language projection, if any) is trained afterwards.
+        The encoder keeps its train-mode random crop on the current-task data.
+        """
+        for param in self.dp.obs_encoder.parameters():
+            param.requires_grad = False
+
+    def obs_encoder_frozen(self):
+        return not any(p.requires_grad for p in self.dp.obs_encoder.parameters())
+
+    @torch.no_grad()
+    def encode_latents(self, data):
+        """
+        Latent replay entries of a training batch: (global condition (B, D) as the U-Net sees it,
+        i.e. obs-encoder features of the normalized obs incl. the task embedding, and the
+        unnormalized action chunk (B, horizon, action_dim)). Call in eval mode (center crop).
+        """
+        batch = self._dp_batch(data)
+        nobs = self.dp.normalizer.normalize(batch["obs"])
+        return self.dp.obs_encoder(nobs), batch["action"]
+
+    def latent_dims(self):
+        """{obs key: feature dims in the global condition}, in the order of the condition."""
+        enc = self.dp.obs_encoder
+        keys = enc.rgb_keys + enc.low_dim_keys
+        meta = enc.shape_meta["obs"]
+        example = {
+            k: torch.zeros((1, meta[k]["horizon"]) + tuple(meta[k]["shape"]), device=enc.device)
+            for k in keys
+        }
+        with torch.no_grad():
+            return {k: int(enc.feature_by_key(example, k).shape[1]) for k in keys}
+
+    def compute_loss_with_latent_replay(self, data, replay_cond, replay_actions):
+        """
+        Diffusion loss on a current-task batch (raw obs through the obs encoder) concatenated with
+        a latent replay batch (stored global conditions and unnormalized action chunks).
+        """
+        batch = self._dp_batch(data)
+        nobs = self.dp.normalizer.normalize(batch["obs"])
+        global_cond = torch.cat([self.dp.obs_encoder(nobs), replay_cond], dim=0)
+        actions = torch.cat([batch["action"], replay_actions], dim=0)
+        nactions = self.dp.normalizer["action"].normalize(actions)
+        return self.dp.compute_loss_from_global_cond(global_cond, nactions)
+
     @torch.no_grad()
     def compute_obs_representations(self, data):
         """

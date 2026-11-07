@@ -47,10 +47,12 @@ from libero.lifelong.utils import (
 RESUMABLE_ALGOS = ["Sequential", "SingleTask", "ER", "RandER", "AnchorER"]
 
 
-def save_report(experiment_dir):
+def save_report(experiment_dir, generic=True):
     # a failing report must not end a long training run
+    # generic=False (runs with pretrain_n_tasks): the generic report assumes every row of the
+    # confusion matrix was trained sequentially, the experiment's own analysis covers those runs
     try:
-        report = write_run_report(experiment_dir)
+        report = write_run_report(experiment_dir) if generic else None
         if report is not None:
             print(f"[info] wrote {report}")
     except Exception as e:
@@ -247,20 +249,55 @@ def main(hydra_cfg):
     if cfg.pretrain_model_path != "":  # load a pretrained model if there is any
         try:
             algo.policy.load_state_dict(torch_load_model(cfg.pretrain_model_path)[0])
-        except:
+        except Exception as e:
             print(
-                f"[error] cannot load pretrained model from {cfg.pretrain_model_path}"
+                f"[error] cannot load pretrained model from {cfg.pretrain_model_path}: {e!r}"
             )
-            sys.exit(0)
+            sys.exit(1)
+        print(f"[info] loaded pretrained model {cfg.pretrain_model_path}")
+    if cfg.policy.get("freeze_obs_encoder", False):
+        assert cfg.pretrain_model_path != "", "[error] freeze_obs_encoder needs pretrain_model_path"
+        algo.policy.freeze_obs_encoder()
+        print("[info] obs encoder frozen")
+
+    # pretrain_n_tasks: the first tasks were learned by the pretrained model (multitask)
+    n_pretrain = int(cfg.get("pretrain_n_tasks", 0) or 0)
+    if n_pretrain > 0:
+        assert cfg.lifelong.algo != "Multitask" and gsz == 1 and cfg.pretrain_model_path != ""
+        assert cfg.lifelong.algo in RESUMABLE_ALGOS, f"[error] pretrain_n_tasks needs {RESUMABLE_ALGOS}"
+        if n_tasks_done < n_pretrain:
+            # success of the pretrained model on its tasks: the row of the pretraining run if it
+            # was evaluated there, otherwise evaluated here
+            pre_result = os.path.join(os.path.dirname(cfg.pretrain_model_path), "result.pt")
+            row = None
+            if os.path.exists(pre_result):
+                pre = torch_load(pre_result)
+                if int(pre.get("n_tasks_evaluated", 0)) == n_pretrain:
+                    row = np.asarray(pre["S_conf_mat"])[n_pretrain - 1, :n_pretrain]
+                    result_summary["L_conf_mat"][n_pretrain - 1][:n_pretrain] = np.asarray(
+                        pre["L_conf_mat"])[n_pretrain - 1, :n_pretrain]
+                    print(f"[info] pretrained success from {pre_result}")
+            if row is None:
+                result_summary["L_conf_mat"][n_pretrain - 1][:n_pretrain] = evaluate_loss(
+                    cfg, algo, benchmark, datasets[:n_pretrain])
+                row = evaluate_success(cfg=cfg, algo=algo, benchmark=benchmark,
+                                       task_ids=list(range(n_pretrain)))
+            result_summary["S_conf_mat"][n_pretrain - 1][:n_pretrain] = row
+            print(("[Pretrained succ.] " + " %4.2f |" * n_pretrain) % tuple(row))
+            result_summary["n_tasks_evaluated"] = n_pretrain
+            result_summary["pretrain_n_tasks"] = n_pretrain
+            torch.save(result_summary, result_file)
+            n_tasks_done = n_pretrain
 
     if n_tasks_done > 0:
-        # state after the last finished task: its best checkpoint, and the datasets
-        # ER-style algorithms keep for replay
-        algo.policy.load_state_dict(
-            torch_load_model(
-                os.path.join(cfg.experiment_dir, f"task{n_tasks_done - 1}_model.pth")
-            )[0]
-        )
+        # state after the last finished task: its best checkpoint (the pretrained model right
+        # after the pretraining tasks), and the datasets ER-style algorithms keep for replay
+        if n_tasks_done > n_pretrain:
+            algo.policy.load_state_dict(
+                torch_load_model(
+                    os.path.join(cfg.experiment_dir, f"task{n_tasks_done - 1}_model.pth")
+                )[0]
+            )
         for i in range(n_tasks_done):
             algo.end_task(datasets[i], i, benchmark)
 
@@ -275,23 +312,25 @@ def main(hydra_cfg):
     if cfg.lifelong.algo == "Multitask":
 
         algo.train()
-        s_fwd, l_fwd = algo.learn_all_tasks(datasets, benchmark, result_summary)
-        result_summary["L_fwd"][-1] = l_fwd
-        result_summary["S_fwd"][-1] = s_fwd
+        # max_tasks: joint training on the first max_tasks tasks only (e.g. pretraining)
+        s_fwd, l_fwd = algo.learn_all_tasks(datasets[:n_tasks_run], benchmark, result_summary)
+        result_summary["L_fwd"][n_tasks_run - 1] = l_fwd
+        result_summary["S_fwd"][n_tasks_run - 1] = s_fwd
 
         # evalute on all seen tasks at the end if eval.eval is true
         if cfg.eval.eval:
-            L = evaluate_loss(cfg, algo, benchmark, datasets)
+            L = evaluate_loss(cfg, algo, benchmark, datasets[:n_tasks_run])
             S = evaluate_success(
                 cfg=cfg,
                 algo=algo,
                 benchmark=benchmark,
-                task_ids=list(range(n_manip_tasks)),
+                task_ids=list(range(n_tasks_run * gsz)),
                 result_summary=result_summary if cfg.eval.save_sim_states else None,
             )
 
-            result_summary["L_conf_mat"][-1] = L
-            result_summary["S_conf_mat"][-1] = S
+            result_summary["L_conf_mat"][n_tasks_run - 1][: len(L)] = L
+            result_summary["S_conf_mat"][n_tasks_run - 1][: len(S)] = S
+            result_summary["n_tasks_evaluated"] = n_tasks_run
 
             if cfg.use_wandb:
                 wandb.run.summary["success_confusion_matrix"] = result_summary[
@@ -304,8 +343,8 @@ def main(hydra_cfg):
                 wandb.run.summary["fwd_transfer_loss"] = result_summary["L_fwd"]
                 wandb.run.summary.update()
 
-            print(("[All task loss ] " + " %4.2f |" * n_tasks) % tuple(L))
-            print(("[All task succ.] " + " %4.2f |" * n_tasks) % tuple(S))
+            print(("[All task loss ] " + " %4.2f |" * len(L)) % tuple(L))
+            print(("[All task succ.] " + " %4.2f |" * len(S)) % tuple(S))
 
             torch.save(result_summary, os.path.join(cfg.experiment_dir, f"result.pt"))
             save_report(cfg.experiment_dir)
@@ -359,7 +398,7 @@ def main(hydra_cfg):
                 torch.save(
                     result_summary, os.path.join(cfg.experiment_dir, f"result.pt")
                 )
-                save_report(cfg.experiment_dir)
+                save_report(cfg.experiment_dir, generic=n_pretrain == 0)
 
             # resume only needs the checkpoint of the last finished task
             previous_checkpoint = os.path.join(cfg.experiment_dir, f"task{i - 1}_model.pth")

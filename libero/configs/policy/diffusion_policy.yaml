@@ -61,3 +61,7 @@ defaults:
     - data_augmentation@color_aug: batch_wise_img_color_jitter_group_aug.yaml
     - data_augmentation@translation_aug: translation_aug.yaml
     - language_encoder: mlp_encoder.yaml
+
+# freeze the obs encoder (ResNets + spatial embedding) after loading pretrain_model_path, e.g. after
+# multitask pretraining; only the U-Net is trained in the lifelong stage
+freeze_obs_encoder: false

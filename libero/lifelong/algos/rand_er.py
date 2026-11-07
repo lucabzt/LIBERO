@@ -1,5 +1,8 @@
+import time
+
 import numpy as np
 import torch
+import torch.nn as nn
 from torch.utils.data import ConcatDataset, DataLoader, RandomSampler, Sampler, Subset
 
 from libero.lifelong.algos.base import Sequential
@@ -58,6 +61,11 @@ class RandER(ER):
             else:
                 indices = self.select_buffer(past_data, n_memories, rng)
             buf = Subset(past_data, indices.tolist())
+            self.replay_cost = {"n_buffer": int(n_memories), "n_past": int(len(past_data))}
+            if self.cfg.lifelong.get("latent_replay", False):
+                self._build_latent_buffer(buf, task)
+                return
+            self.replay_cost.update(self._buffer_bytes(raw=True))
             print(
                 f"[info] {self.cfg.lifelong.algo} buffer: {n_memories} of {len(past_data)} "
                 f"past transitions ({n_memories / len(past_data):.2%})"
@@ -88,3 +96,99 @@ class RandER(ER):
     def select_buffer(self, past_data, n_memories, rng):
         """Indices into past_data (ConcatDataset of the past tasks) of the replay buffer."""
         return rng.choice(len(past_data), size=n_memories, replace=False)
+
+    # ------------------------------------------------------------------
+    # Latent replay (MLR, Yu et al. 2026): with a frozen obs encoder the buffer holds the encoder
+    # features (the U-Net's global condition) and action chunks instead of raw observations.
+    # Since the encoder is frozen, encoding the selected samples at the start of the task gives
+    # exactly the latents stored when the samples were first seen.
+    # ------------------------------------------------------------------
+    def _buffer_bytes(self, raw):
+        """Storage per buffer sample and in total, raw (uint8 images of the n_obs_steps frames the
+        policy reads, float32 low-dim obs and actions) and latent (float32 features without the
+        task embedding, which is one vector per task, and float32 actions)."""
+        policy = self.policy
+        meta = self.cfg.shape_meta["all_shapes"]
+        n_obs = self.cfg.policy.n_obs_steps
+        action_bytes = 4 * self.cfg.policy.horizon * self.cfg.shape_meta["ac_dim"]
+        raw_bytes = action_bytes + n_obs * (
+            sum(int(np.prod(meta[k])) for k in self.cfg.data.obs.modality.rgb)
+            + 4 * sum(int(np.prod(meta[k])) for k in self.cfg.data.obs.modality.low_dim)
+        )
+        dims = policy.latent_dims()
+        latent_bytes = action_bytes + 4 * sum(d for k, d in dims.items() if k != "task_emb")
+        n = self.replay_cost["n_buffer"]
+        return {
+            "replay": "raw" if raw else "latent",
+            "raw_bytes_per_sample": int(raw_bytes),
+            "latent_bytes_per_sample": int(latent_bytes),
+            "buffer_bytes": int(n * (raw_bytes if raw else latent_bytes)),
+            "buffer_bytes_if_raw": int(n * raw_bytes),
+            "buffer_bytes_if_latent": int(n * latent_bytes),
+        }
+
+    def _build_latent_buffer(self, buf, task):
+        assert self.policy.obs_encoder_frozen(), (
+            "[error] lifelong.latent_replay needs a frozen obs encoder (policy.freeze_obs_encoder)"
+        )
+        t0 = time.time()
+        loader = DataLoader(buf, batch_size=128, shuffle=False, num_workers=self.cfg.train.num_workers)
+        conds, actions = [], []
+        was_training = self.policy.training
+        self.policy.eval()  # center crop, as at test time
+        for data in loader:
+            cond, act = self.policy.encode_latents(self.map_tensor_to_device(data))
+            conds.append(cond)
+            actions.append(act)
+        self.policy.train(was_training)
+        self.latent_cond = torch.cat(conds).contiguous()
+        self.latent_actions = torch.cat(actions).contiguous()
+        self.latent_generator = torch.Generator(device=self.latent_cond.device)
+        self.latent_generator.manual_seed(self.cfg.seed + task)
+        self.latent_perm, self.latent_pos = None, 0
+        self.replay_batch_size = max(
+            1, round(self.cfg.lifelong.get("replay_ratio", 1.0) * self.cfg.train.batch_size)
+        )
+        self.buffer = None  # observe takes the latent path
+        self.replay_cost.update(self._buffer_bytes(raw=False))
+        self.replay_cost["latent_encode_time_s"] = time.time() - t0
+        self.replay_cost["latent_dim"] = int(self.latent_cond.shape[1])
+        print(
+            f"[info] {self.cfg.lifelong.algo} latent buffer: {len(self.latent_cond)} samples, "
+            f"global cond dim {self.latent_cond.shape[1]}, "
+            f"{self.replay_cost['buffer_bytes'] / 1e6:.1f} MB latent vs "
+            f"{self.replay_cost['buffer_bytes_if_raw'] / 1e6:.1f} MB raw, "
+            f"encoded in {self.replay_cost['latent_encode_time_s']:.0f} s"
+        )
+
+    def _next_latent_indices(self):
+        """Endless random permutations of the latent buffer (as continuous_replay_loader)."""
+        n, out, need = len(self.latent_cond), [], self.replay_batch_size
+        while need > 0:
+            if self.latent_perm is None or self.latent_pos >= n:
+                self.latent_perm = torch.randperm(
+                    n, generator=self.latent_generator, device=self.latent_cond.device
+                )
+                self.latent_pos = 0
+            take = self.latent_perm[self.latent_pos : self.latent_pos + need]
+            self.latent_pos += len(take)
+            need -= len(take)
+            out.append(take)
+        return torch.cat(out)
+
+    def observe(self, data):
+        if getattr(self, "latent_cond", None) is None or self.current_task == 0:
+            return super().observe(data)
+        data = self.map_tensor_to_device(data)
+        idx = self._next_latent_indices()
+        self.optimizer.zero_grad()
+        loss = self.policy.compute_loss_with_latent_replay(
+            data, self.latent_cond[idx], self.latent_actions[idx]
+        )
+        (self.loss_scale * loss).backward()
+        if self.cfg.train.grad_clip is not None:
+            nn.utils.clip_grad_norm_(
+                [p for p in self.policy.parameters() if p.requires_grad], self.cfg.train.grad_clip
+            )
+        self.optimizer.step()
+        return loss.item()
