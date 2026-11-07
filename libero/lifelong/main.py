@@ -145,12 +145,14 @@ def main(hydra_cfg):
         # clone(): the embeddings are views of one tensor. Spawned DataLoader workers get
         # one fd per tensor storage, and Python < 3.9 rejects the resulting duplicate fds
         # ("bad value(s) in fds_to_keep") once several tasks share a DataLoader (multitask).
+        # data.truncate_obs: only the frame_stack obs frames the policy reads (see SequenceVLDataset)
+        obs_frames_only = bool(cfg.data.get("truncate_obs", False))
         datasets = [
-            SequenceVLDataset(ds, emb.clone())
+            SequenceVLDataset(ds, emb.clone(), obs_frames_only)
             for (ds, emb) in zip(manip_datasets, task_embs)
         ]
         val_datasets = [
-            None if ds is None else SequenceVLDataset(ds, emb.clone())
+            None if ds is None else SequenceVLDataset(ds, emb.clone(), obs_frames_only)
             for (ds, emb) in zip(val_manip_datasets, task_embs)
         ]
         n_demos = [data.n_demos for data in datasets]

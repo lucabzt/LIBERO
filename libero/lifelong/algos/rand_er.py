@@ -1,8 +1,23 @@
 import numpy as np
-from torch.utils.data import ConcatDataset, DataLoader, RandomSampler, Subset
+import torch
+from torch.utils.data import ConcatDataset, DataLoader, RandomSampler, Sampler, Subset
 
 from libero.lifelong.algos.base import Sequential
 from libero.lifelong.algos.er import ER, cycle
+
+
+class EndlessRandomSampler(Sampler):
+    """Random permutations of range(n), one after another without end: the DataLoader never
+    restarts (cycle() restarts it after every pass over the buffer, and with a small buffer and a
+    large replay batch every restart stalls the training step), and every batch is full."""
+
+    def __init__(self, n, seed):
+        self.n = n
+        self.generator = torch.Generator().manual_seed(seed)
+
+    def __iter__(self):
+        while True:
+            yield from torch.randperm(self.n, generator=self.generator).tolist()
 
 
 class RandER(ER):
@@ -50,15 +65,25 @@ class RandER(ER):
             replay_batch_size = max(
                 1, round(self.cfg.lifelong.get("replay_ratio", 1.0) * self.cfg.train.batch_size)
             )
-            self.buffer = cycle(
-                DataLoader(
-                    buf,
-                    batch_size=replay_batch_size,
-                    num_workers=self.cfg.train.num_workers,
-                    sampler=RandomSampler(buf),
-                    persistent_workers=True,
+            if self.cfg.lifelong.get("continuous_replay_loader", False):
+                self.buffer = iter(
+                    DataLoader(
+                        buf,
+                        batch_size=replay_batch_size,
+                        num_workers=self.cfg.train.num_workers,
+                        sampler=EndlessRandomSampler(len(buf), self.cfg.seed + task),
+                    )
                 )
-            )
+            else:
+                self.buffer = cycle(
+                    DataLoader(
+                        buf,
+                        batch_size=replay_batch_size,
+                        num_workers=self.cfg.train.num_workers,
+                        sampler=RandomSampler(buf),
+                        persistent_workers=True,
+                    )
+                )
 
     def select_buffer(self, past_data, n_memories, rng):
         """Indices into past_data (ConcatDataset of the past tasks) of the replay buffer."""

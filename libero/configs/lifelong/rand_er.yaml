@@ -9,3 +9,7 @@ replay_ratio: 1.0
 # .npy of indices into the past data (all past tasks concatenated) used as the buffer instead of
 # the uniform draw, e.g. a fixed buffer for controlled interventions; null: uniform draw
 buffer_indices_file: null
+# true: the replay DataLoader draws endless random permutations of the buffer (never restarts,
+# always full replay batches); false: cycle() over a RandomSampler (restarts every buffer pass,
+# last batch of every pass smaller), as in the runs before 2026-11-05
+continuous_replay_loader: false

@@ -127,8 +127,33 @@ def get_normalizer_stats(sequence_datasets, low_dim_keys):
     return stats
 
 
+class _ObsFramesOnlySequenceDataset(SequenceDataset):
+    """SequenceDataset that reads only the frame_stack obs frames t - frame_stack + 1 ... t of a
+    sample (obs seq_length 1), the first frame_stack of the frame_stack - 1 + seq_length frames
+    SequenceDataset returns otherwise (same start padding); actions keep the full seq_length."""
+
+    def get_obs_sequence_from_demo(
+        self, demo_id, index_in_demo, keys, num_frames_to_stack=0, seq_length=1, prefix="obs"
+    ):
+        return super().get_obs_sequence_from_demo(
+            demo_id, index_in_demo, keys, num_frames_to_stack, 1, prefix
+        )
+
+
 class SequenceVLDataset(Dataset):
-    def __init__(self, sequence_dataset, task_emb):
+    """
+    obs_frames_only (data.truncate_obs): every sample holds only the frame_stack observation frames
+    t - frame_stack + 1 ... t instead of frame_stack - 1 + seq_len frames. The diffusion policy only
+    reads obs[:, :n_obs_steps] (n_obs_steps = frame_stack), so it gets the same inputs while the
+    DataLoader workers read ~8x fewer images from the hdf5 files (the bottleneck of training).
+    Works on a shallow copy, the given sequence_dataset is left unchanged.
+    """
+
+    def __init__(self, sequence_dataset, task_emb, obs_frames_only=False):
+        if obs_frames_only:
+            assert type(sequence_dataset) is SequenceDataset, type(sequence_dataset)
+            sequence_dataset = copy.copy(sequence_dataset)
+            sequence_dataset.__class__ = _ObsFramesOnlySequenceDataset
         self.sequence_dataset = sequence_dataset
         self.task_emb = task_emb
         self.n_demos = self.sequence_dataset.n_demos

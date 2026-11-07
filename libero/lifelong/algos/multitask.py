@@ -4,6 +4,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from diffusers.optimization import get_cosine_schedule_with_warmup
 from torch.utils.data import ConcatDataset, DataLoader, RandomSampler
 
 from libero.lifelong.algos.base import Sequential
@@ -38,6 +39,16 @@ class Multitask(Sequential):
             persistent_workers=True,
         )
 
+        if self._per_step_scheduler():
+            # as in learn_one_task: linear warmup over warmup_ratio of all steps, then cosine
+            # decay to 0 (stepped per batch; start_task leaves self.scheduler None for it)
+            n_steps = self.cfg.train.n_epochs * len(train_dataloader)
+            self.scheduler = get_cosine_schedule_with_warmup(
+                self.optimizer,
+                num_warmup_steps=round(self.cfg.train.scheduler.kwargs.warmup_ratio * n_steps),
+                num_training_steps=n_steps,
+            )
+
         prev_success_rate = -1.0
         best_state_dict = self.policy.state_dict()  # currently save the best model
 
@@ -58,6 +69,8 @@ class Multitask(Sequential):
                 for (idx, data) in enumerate(train_dataloader):
                     loss = self.observe(data)
                     training_loss += loss
+                    if self._per_step_scheduler():
+                        self.scheduler.step()
                 training_loss /= len(train_dataloader)
             else:  # just evaluate the zero-shot performance on 0-th epoch
                 training_loss = 0.0
@@ -113,7 +126,7 @@ class Multitask(Sequential):
                         flush=True,
                     )
 
-            if self.scheduler is not None and epoch > 0:
+            if self.scheduler is not None and epoch > 0 and not self._per_step_scheduler():
                 self.scheduler.step()
 
         # load the best policy if there is any
