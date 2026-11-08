@@ -196,6 +196,26 @@ class DiffusionPolicy(BasePolicy):
         nactions = self.dp.normalizer["action"].normalize(actions)
         return self.dp.compute_loss_from_global_cond(global_cond, nactions)
 
+    def compute_loss_encoder_grad_mask(self, data, grad_mask):
+        """
+        Diffusion loss of a batch where only the samples with grad_mask (B,) bool send gradients
+        into the obs encoder; the others are encoded in the same mode (train: random crop) under
+        no_grad, i.e. as freshly recomputed latents. The U-Net gets gradients from all samples.
+        GroupNorm is per sample, so splitting the batch does not change the features.
+        """
+        batch = self._dp_batch(data)
+        nobs = self.dp.normalizer.normalize(batch["obs"])
+        conds = []
+        if grad_mask.any():
+            conds.append(self.dp.obs_encoder({k: v[grad_mask] for k, v in nobs.items()}))
+        if (~grad_mask).any():
+            with torch.no_grad():
+                conds.append(self.dp.obs_encoder({k: v[~grad_mask] for k, v in nobs.items()}))
+        global_cond = torch.cat(conds, dim=0)
+        actions = torch.cat([batch["action"][grad_mask], batch["action"][~grad_mask]], dim=0)
+        nactions = self.dp.normalizer["action"].normalize(actions)
+        return self.dp.compute_loss_from_global_cond(global_cond, nactions)
+
     @torch.no_grad()
     def compute_obs_representations(self, data):
         """

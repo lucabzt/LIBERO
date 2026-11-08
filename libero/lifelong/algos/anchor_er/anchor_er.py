@@ -184,6 +184,8 @@ class AnchorER(RandER):
         else:
             raise ValueError(f"[error] unknown AnchorER mode {cfg.mode}")
         timings["anchors"] = time.time() - t0
+        # pool indices of the anchors (HybridER replays them differently)
+        self.last_anchors = anchors if cfg.mode == "add" else None
         info["n_anchors"] = int(len(anchors))
         info["n_buffer"] = int(len(indices))
         info["mode"] = cfg.mode

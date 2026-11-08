@@ -3,7 +3,7 @@ import time
 import numpy as np
 import torch
 import torch.nn as nn
-from torch.utils.data import ConcatDataset, DataLoader, RandomSampler, Sampler, Subset
+from torch.utils.data import ConcatDataset, DataLoader, Dataset, RandomSampler, Sampler, Subset
 
 from libero.lifelong.algos.base import Sequential
 from libero.lifelong.algos.er import ER, cycle
@@ -21,6 +21,22 @@ class EndlessRandomSampler(Sampler):
     def __iter__(self):
         while True:
             yield from torch.randperm(self.n, generator=self.generator).tolist()
+
+
+class FirstN(Dataset):
+    """The first n samples of a task dataset (LIBERO ER's buffer: TruncatedSequenceDataset), keeping
+    .sequence_dataset so that AnchorER can map indices to demos / timesteps."""
+
+    def __init__(self, dataset, n):
+        self.dataset = dataset
+        self.n = min(n, len(dataset))
+        self.sequence_dataset = dataset.sequence_dataset
+
+    def __len__(self):
+        return self.n
+
+    def __getitem__(self, idx):
+        return self.dataset[idx]
 
 
 class RandER(ER):
@@ -44,7 +60,7 @@ class RandER(ER):
         # skip ER.start_task, which builds the truncated per-task buffers
         Sequential.start_task(self, task)
         if self.current_task > 0:
-            past_data = ConcatDataset(self.datasets)
+            past_data = self.past_pool()
             n_memories = self.cfg.lifelong.get("n_memories")
             if n_memories is None:
                 n_memories = max(1, round(self.cfg.lifelong.buffer_fraction * len(past_data)))
@@ -92,6 +108,15 @@ class RandER(ER):
                         persistent_workers=True,
                     )
                 )
+
+    def past_pool(self):
+        """The past data the buffer is drawn from. lifelong.pool_n_per_task (if set): only the first
+        pool_n_per_task samples of every past task, as LIBERO ER (n_memories=1000); with
+        buffer_fraction=1.0 the buffer is then exactly ER's buffer."""
+        n = self.cfg.lifelong.get("pool_n_per_task")
+        if n is None:
+            return ConcatDataset(self.datasets)
+        return ConcatDataset([FirstN(ds, int(n)) for ds in self.datasets])
 
     def select_buffer(self, past_data, n_memories, rng):
         """Indices into past_data (ConcatDataset of the past tasks) of the replay buffer."""

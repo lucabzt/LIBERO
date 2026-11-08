@@ -50,3 +50,6 @@ selection_device: cuda
 latent_replay: false
 # replay DataLoader as in rand_er.yaml (true: endless random permutations, always full batches)
 continuous_replay_loader: false
+# only the first pool_n_per_task samples of every past task form the pool the buffer is drawn from
+# (LIBERO ER: 1000, with buffer_fraction=1.0 the buffer is ER's buffer); null: all past data
+pool_n_per_task: null
