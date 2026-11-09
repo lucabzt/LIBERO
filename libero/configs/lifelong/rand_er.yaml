@@ -19,3 +19,18 @@ latent_replay: false
 # only the first pool_n_per_task samples of every past task form the pool the buffer is drawn from
 # (LIBERO ER: 1000, with buffer_fraction=1.0 the buffer is ER's buffer); null: all past data
 pool_n_per_task: null
+# uniform (RandER) | task_stratified (exact per-task quotas proportional to task size, uniform
+# within a task) | rainbow (same quotas, evenly spaced ranks of the policy's noise-denoise action
+# disagreement within a task; Rainbow Memory with AnchorER's step-2 score) | kmeans (same quotas,
+# k-means on the obs latent within a task, equal share per cluster, random within a cluster)
+buffer_selection: uniform
+# rainbow disagreement: AnchorER defaults (anchor_er.yaml)
+rainbow_noise_level: 20
+rainbow_inference_steps: 100
+rainbow_disagreement_metric: se3
+rainbow_action_scale: [0.05, 0.05, 0.05, 0.5, 0.5, 0.5, 1.0]
+selection_batch_size: 128
+# kmeans selection: clusters per task (fewer if the task's quota is smaller), latent keys as AnchorER
+kmeans_n_clusters: 10
+kmeans_n_init: 20
+representation_keys: [agentview_rgb, eye_in_hand_rgb, gripper_states, joint_states]

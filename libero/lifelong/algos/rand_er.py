@@ -1,3 +1,4 @@
+import os
 import time
 
 import numpy as np
@@ -39,6 +40,33 @@ class FirstN(Dataset):
         return self.dataset[idx]
 
 
+def proportional_quotas(sizes, n):
+    """n split over groups proportionally to sizes, rounded by largest remainder (sum exactly n)."""
+    sizes = np.asarray(sizes, dtype=np.int64)
+    exact = n * sizes / sizes.sum()
+    quotas = np.floor(exact).astype(np.int64)
+    rest = n - quotas.sum()
+    quotas[np.argsort(-(exact - quotas), kind="stable")[:rest]] += 1
+    assert quotas.sum() == n and (quotas <= sizes).all()
+    return quotas
+
+
+def equal_quotas(capacities, n, rng):
+    """n split as equally as possible over groups with the given capacities: round robin in a
+    random group order, groups that are full drop out (their spare share goes to the others)."""
+    capacities = np.asarray(capacities, dtype=np.int64)
+    assert capacities.sum() >= n
+    alloc = np.zeros_like(capacities)
+    order = rng.permutation(len(capacities))
+    while alloc.sum() < n:
+        for g in order:
+            if alloc.sum() == n:
+                break
+            if alloc[g] < capacities[g]:
+                alloc[g] += 1
+    return alloc
+
+
 class RandER(ER):
     """
     Experience replay with a buffer of a fixed fraction of all past task data, as
@@ -49,6 +77,21 @@ class RandER(ER):
     lifelong.buffer_indices_file (if set): a .npy of indices into the past data (all past tasks
     concatenated, as ConcatDataset) used as the buffer instead of select_buffer, e.g. for
     controlled single-task interventions with a fixed, precomputed buffer.
+
+    lifelong.buffer_selection: how the n_memories samples are chosen from the past data
+      uniform:         uniformly from all past data (RandER; per-task counts vary randomly)
+      task_stratified: exact per-task quotas proportional to the task sizes (largest remainder),
+                       uniformly within each task (control: RandER without the count noise)
+      rainbow:         the same quotas; within each task the samples are sorted by the current
+                       policy's noise-denoise action disagreement (AnchorER's step-2 score) and
+                       taken at evenly spaced ranks, so the buffer spans easy to hard samples
+                       (Rainbow Memory, Bang et al. CVPR 2021, with the disagreement in place of
+                       the perturbation uncertainty)
+      kmeans:          the same quotas; within each task k-means (kmeans_n_clusters) on the current
+                       policy's obs latent (AnchorER representation_keys, every dimension z-scored
+                       with the past-data stats, as AnchorER step 1), the task's quota split equally
+                       over its clusters (spare slots of small clusters go to the others), random
+                       within a cluster: equal coverage of the task's state space
 
     Unlike ER (the first n_memories sequences of every past task), the buffer size
     grows with the amount of past data and is not split evenly across tasks.
@@ -120,7 +163,116 @@ class RandER(ER):
 
     def select_buffer(self, past_data, n_memories, rng):
         """Indices into past_data (ConcatDataset of the past tasks) of the replay buffer."""
-        return rng.choice(len(past_data), size=n_memories, replace=False)
+        mode = self.cfg.lifelong.get("buffer_selection", "uniform")
+        if mode == "uniform":
+            return rng.choice(len(past_data), size=n_memories, replace=False)
+        sizes = np.diff([0] + list(past_data.cumulative_sizes))
+        offsets = np.concatenate([[0], np.cumsum(sizes)[:-1]])
+        quotas = proportional_quotas(sizes, n_memories)
+        if mode == "task_stratified":
+            parts = [off + rng.choice(n, size=q, replace=False) for off, n, q in zip(offsets, sizes, quotas)]
+            print(f"[info] task-stratified buffer, per task {quotas.tolist()}")
+            return np.concatenate(parts)
+        if mode == "rainbow":
+            return self._rainbow_selection(past_data, sizes, offsets, quotas)
+        if mode == "kmeans":
+            return self._kmeans_selection(past_data, sizes, offsets, quotas, rng)
+        raise ValueError(f"[error] unknown lifelong.buffer_selection {mode}")
+
+    def _rainbow_selection(self, past_data, sizes, offsets, quotas):
+        t0 = time.time()
+        self.policy.eval()
+        try:
+            parts, log = [], {}
+            for k, (off, n, q) in enumerate(zip(offsets, sizes, quotas)):
+                scores = self._disagreement(Subset(past_data, list(range(off, off + n))))
+                order = np.argsort(scores, kind="stable")
+                # evenly spaced ranks: the centers of q equal bins of the sorted scores
+                ranks = np.floor((np.arange(q) + 0.5) * n / q).astype(np.int64)
+                chosen = order[ranks]
+                parts.append(off + chosen)
+                log[f"scores_task{k}"] = scores
+                log[f"chosen_task{k}"] = chosen
+                print(
+                    f"[info] rainbow task {k}: {q} of {n}, disagreement median {np.median(scores):.4f} "
+                    f"(chosen min {scores[chosen].min():.4f}, max {scores[chosen].max():.4f})"
+                )
+        finally:
+            self.policy.train()
+            torch.cuda.empty_cache()
+        out_dir = os.path.join(self.experiment_dir, "rainbow")
+        os.makedirs(out_dir, exist_ok=True)
+        np.savez_compressed(os.path.join(out_dir, f"task{self.current_task}.npz"), quotas=quotas, **log)
+        self.replay_cost_selection_s = time.time() - t0
+        print(f"[info] rainbow buffer, per task {quotas.tolist()}, selection {time.time() - t0:.0f} s")
+        return np.concatenate(parts)
+
+    def _kmeans_selection(self, past_data, sizes, offsets, quotas, rng):
+        from libero.lifelong.algos.anchor_er import selection
+
+        t0 = time.time()
+        cfg = self.cfg.lifelong
+        keys = list(cfg.get("representation_keys") or
+                    ["agentview_rgb", "eye_in_hand_rgb", "gripper_states", "joint_states"])
+        n_clusters = int(cfg.get("kmeans_n_clusters", 10))
+        generator = torch.Generator().manual_seed(self.cfg.seed + self.current_task)
+        self.policy.eval()
+        try:
+            reprs = self._representations(past_data, keys)
+        finally:
+            self.policy.train()
+        latents, _ = selection.normalize_representations(reprs, keys)
+        del reprs
+        parts, log = [], {}
+        for k, (off, n, q) in enumerate(zip(offsets, sizes, quotas)):
+            labels = selection.kmeans(latents[off:off + n], n_clusters=min(n_clusters, q),
+                                      n_init=cfg.get("kmeans_n_init", 20), generator=generator).cpu().numpy()
+            members = [np.nonzero(labels == c)[0] for c in range(labels.max() + 1)]
+            alloc = equal_quotas([len(m) for m in members], q, rng)
+            chosen = np.concatenate([rng.choice(m, size=a, replace=False) for m, a in zip(members, alloc) if a > 0])
+            parts.append(off + chosen)
+            log[f"labels_task{k}"] = labels
+            log[f"chosen_task{k}"] = chosen
+            print(f"[info] kmeans task {k}: {q} of {n}, cluster sizes {[len(m) for m in members]}, "
+                  f"taken {alloc.tolist()}")
+        torch.cuda.empty_cache()
+        out_dir = os.path.join(self.experiment_dir, "kmeans")
+        os.makedirs(out_dir, exist_ok=True)
+        np.savez_compressed(os.path.join(out_dir, f"task{self.current_task}.npz"), quotas=quotas, **log)
+        print(f"[info] kmeans buffer, per task {quotas.tolist()}, selection {time.time() - t0:.0f} s")
+        return np.concatenate(parts)
+
+    @torch.no_grad()
+    def _representations(self, dataset, keys):
+        """obs-encoder features {key: (N, D)} of the given keys (as AnchorER._representations)."""
+        reprs = {}
+        loader = DataLoader(dataset, batch_size=self.cfg.lifelong.get("selection_batch_size", 128),
+                            shuffle=False, num_workers=self.cfg.train.num_workers)
+        for data in loader:
+            data = self.map_tensor_to_device(data)
+            for key, value in self.policy.compute_obs_representations(data).items():
+                if key in keys:
+                    reprs.setdefault(key, []).append(value.float())
+        return {key: torch.cat(v, dim=0) for key, v in reprs.items()}
+
+    @torch.no_grad()
+    def _disagreement(self, dataset):
+        """AnchorER's noise-denoise action disagreement (lifelong.rainbow_* settings) per sample."""
+        cfg = self.cfg.lifelong
+        metric = cfg.get("rainbow_disagreement_metric", "se3")
+        scores = []
+        loader = DataLoader(dataset, batch_size=cfg.get("selection_batch_size", 128), shuffle=False,
+                            num_workers=self.cfg.train.num_workers)
+        for data in loader:
+            data = self.map_tensor_to_device(data)
+            scores.append(self.policy.compute_action_disagreement(
+                data,
+                noise_level=cfg.get("rainbow_noise_level", 20),
+                ood_metric=metric,
+                num_inference_steps=cfg.get("rainbow_inference_steps", 100),
+                action_scale=cfg.get("rainbow_action_scale") if metric == "se3" else None,
+            ).cpu())
+        return torch.cat(scores).numpy()
 
     # ------------------------------------------------------------------
     # Latent replay (MLR, Yu et al. 2026): with a frozen obs encoder the buffer holds the encoder
