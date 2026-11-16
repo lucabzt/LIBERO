@@ -1,4 +1,6 @@
+import contextlib
 import copy
+import fcntl
 import gc
 import numpy as np
 import os
@@ -50,7 +52,57 @@ def raw_obs_to_tensor_obs(obs, task_emb, cfg):
     return data
 
 
+@contextlib.contextmanager
+def eval_lock():
+    """
+    Exclusive lock on the file $LIBERO_EVAL_LOCK (no lock if unset) while one task is evaluated.
+    Every simulator worker holds an EGL render context of ~0.65 GB GPU memory (20 workers: 13 GB),
+    so two runs evaluating on one GPU next to the training processes exhaust its memory; the
+    NVIDIA driver then fails to create a context and the worker segfaults (EOFError in the
+    vector env). With one lock file per GPU only one run evaluates on it at a time.
+    """
+    path = os.environ.get("LIBERO_EVAL_LOCK")
+    if not path:
+        yield
+        return
+    with open(path, "a") as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(f, fcntl.LOCK_UN)
+
+
 def evaluate_one_task_success(
+    cfg, algo, task, task_emb, task_id, sim_states=None, task_str="", retries=5
+):
+    """
+    evaluate_one_task_success_once under eval_lock, started again from the first episode when a
+    simulator worker dies (EOFError / broken pipe in the vector env), so that a dead worker does
+    not end the run (a resume would retrain the whole task). The init states are fixed, so a
+    repeated evaluation is the same evaluation.
+    """
+    for attempt in range(retries + 1):
+        with eval_lock():
+            # cached but unused training memory of this process, for the render contexts
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            try:
+                return evaluate_one_task_success_once(
+                    cfg, algo, task, task_emb, task_id, sim_states=sim_states, task_str=task_str
+                )
+            except (EOFError, BrokenPipeError, ConnectionResetError) as e:
+                # recorded sim states of the broken attempt cannot be taken back
+                if attempt == retries or sim_states is not None:
+                    raise
+                print(f"[warning] evaluation of task {task_id}: simulator worker died ({e!r}), "
+                      f"evaluating the task again ({attempt + 1}/{retries})", flush=True)
+                # the surviving workers of the broken attempt exit once their pipes are closed
+                gc.collect()
+                time.sleep(30)
+
+
+def evaluate_one_task_success_once(
     cfg, algo, task, task_emb, task_id, sim_states=None, task_str=""
 ):
     """
