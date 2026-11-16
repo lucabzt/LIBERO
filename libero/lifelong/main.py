@@ -221,8 +221,9 @@ def main(hydra_cfg):
             f"[error] resume is only supported for {RESUMABLE_ALGOS}"
         )
         result_summary = torch_load(result_file)
-        n_tasks_done = int(result_summary.get("n_tasks_evaluated", 0))
-        if n_tasks_done >= n_tasks_run:
+        # eval.final_only runs count trained (not evaluated) tasks in n_tasks_trained
+        n_tasks_done = int(result_summary.get("n_tasks_trained", result_summary.get("n_tasks_evaluated", 0)))
+        if int(result_summary.get("n_tasks_evaluated", 0)) >= n_tasks_run:
             print(f"[info] {cfg.experiment_dir} is already finished, nothing to resume")
             return
         # the checkpoints hold the EMA weights, not the raw weights training continues from
@@ -349,6 +350,11 @@ def main(hydra_cfg):
             torch.save(result_summary, os.path.join(cfg.experiment_dir, f"result.pt"))
             save_report(cfg.experiment_dir)
     else:
+        # eval.final_only: no evaluation after the single tasks, one evaluation of all tasks after
+        # the last one (only the last row of the confusion matrices is filled)
+        final_only = bool(cfg.eval.get("final_only", False))
+        if final_only:
+            assert n_pretrain == 0 and gsz == 1, "[error] eval.final_only needs pretrain_n_tasks 0, task_group_size 1"
         for i in range(n_tasks_done, n_tasks_run):
             print(f"[info] start training on task {i}")
             algo.train()
@@ -361,8 +367,14 @@ def main(hydra_cfg):
             result_summary["L_fwd"][i] = l_fwd
             t1 = time.time()
 
+            result_summary["n_tasks_trained"] = i + 1
+            if final_only:
+                # resume continues after this task (the checkpoint is saved by learn_one_task)
+                torch.save(result_summary, result_file)
+                print(f"[info] train time (min) {(t1-t0)/60:.1f}, no evaluation (eval.final_only)")
+
             # evalute on all seen tasks at the end of learning each task
-            if cfg.eval.eval:
+            if cfg.eval.eval and not final_only:
                 L = evaluate_loss(cfg, algo, benchmark, datasets[: i + 1])
                 t2 = time.time()
                 S = evaluate_success(
@@ -404,6 +416,29 @@ def main(hydra_cfg):
             previous_checkpoint = os.path.join(cfg.experiment_dir, f"task{i - 1}_model.pth")
             if not cfg.train.keep_all_checkpoints and os.path.exists(previous_checkpoint):
                 os.remove(previous_checkpoint)
+
+        if final_only and cfg.eval.eval and int(result_summary.get("n_tasks_evaluated", 0)) < n_tasks_run:
+            # all tasks trained (also when resuming a run whose final evaluation was interrupted:
+            # the last checkpoint is loaded above)
+            i = n_tasks_run - 1
+            t0 = time.time()
+            L = evaluate_loss(cfg, algo, benchmark, datasets[: i + 1])
+            S = evaluate_success(
+                cfg=cfg,
+                algo=algo,
+                benchmark=benchmark,
+                task_ids=list(range(i + 1)),
+                result_summary=result_summary if cfg.eval.save_sim_states else None,
+            )
+            result_summary["L_conf_mat"][i][: i + 1] = L
+            result_summary["S_conf_mat"][i][: i + 1] = S
+            result_summary["final_success"] = float(np.mean(S))
+            result_summary["n_tasks_evaluated"] = i + 1
+            torch.save(result_summary, result_file)
+            print(f"[info] final evaluation time (min) {(time.time()-t0)/60:.1f}")
+            print(("[Final loss ] " + " %4.2f |" * (i + 1)) % tuple(L))
+            print(("[Final succ.] " + " %4.2f |" * (i + 1)) % tuple(S))
+            print(f"[info] final success rate (mean over all {i + 1} tasks): {np.mean(S):.3f}")
 
     print("[info] finished learning\n")
     if cfg.use_wandb:

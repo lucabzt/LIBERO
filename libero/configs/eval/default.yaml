@@ -1,5 +1,7 @@
 load_path: "" # only used when separately evaluating a pretrained model
 eval: true
+# true: no evaluation after the single tasks, only one evaluation of all tasks after the last task
+final_only: false
 batch_size: 64
 num_workers: 4
 n_eval: 20

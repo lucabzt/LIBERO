@@ -93,6 +93,10 @@ class RandER(ER):
                        over its clusters (spare slots of small clusters go to the others), random
                        within a cluster: equal coverage of the task's state space
 
+    lifelong.fixed_buffer: instead of reselecting the whole buffer at every task, every task's
+    share is selected once (with buffer_selection, from that task's data only) at the start of the
+    next task and never changed (see _fixed_buffer): no past data has to be stored beyond the buffer.
+
     Unlike ER (the first n_memories sequences of every past task), the buffer size
     grows with the amount of past data and is not split evenly across tasks.
     Every training batch is concatenated with a buffer batch of replay_ratio times its size
@@ -117,6 +121,9 @@ class RandER(ER):
                 )
                 n_memories = len(indices)
                 print(f"[info] buffer indices from {indices_file}")
+            elif self.cfg.lifelong.get("fixed_buffer", False):
+                indices = self._fixed_buffer(past_data, rng)
+                n_memories = len(indices)
             else:
                 indices = self.select_buffer(past_data, n_memories, rng)
             buf = Subset(past_data, indices.tolist())
@@ -179,7 +186,48 @@ class RandER(ER):
             return self._kmeans_selection(past_data, sizes, offsets, quotas, rng)
         raise ValueError(f"[error] unknown lifelong.buffer_selection {mode}")
 
-    def _rainbow_selection(self, past_data, sizes, offsets, quotas):
+    def _fixed_buffer(self, past_data, rng):
+        """lifelong.fixed_buffer: the share of every past task is chosen once, at the start of the
+        next task, from that task's data only (with the policy right after that task; for kmeans
+        the latents are z-scored with that task's own stats) and kept unchanged afterwards, so the
+        data of a task can be dropped once its share is stored. Share of task k:
+        max(1, round(buffer_fraction * n_k)) (as the proportional quotas of the reselected buffer up
+        to rounding). Every share is saved as local indices in <run>/fixed_buffer/task<k>.npy and
+        loaded from there (resume, later tasks). Returns the indices into past_data."""
+        cfg = self.cfg.lifelong
+        assert cfg.get("n_memories") is None, "[error] lifelong.fixed_buffer uses buffer_fraction per task"
+        assert not cfg.get("buffer_indices_file"), "[error] lifelong.fixed_buffer with buffer_indices_file"
+        mode = cfg.get("buffer_selection", "uniform")
+        sizes = np.diff([0] + list(past_data.cumulative_sizes))
+        offsets = np.concatenate([[0], np.cumsum(sizes)[:-1]])
+        out_dir = os.path.join(self.experiment_dir, "fixed_buffer")
+        os.makedirs(out_dir, exist_ok=True)
+        parts, quotas = [], []
+        for k, (off, n) in enumerate(zip(offsets, sizes)):
+            path = os.path.join(out_dir, f"task{k}.npy")
+            if not os.path.exists(path):
+                # only the task that just ended can be selected now (its data and the policy after it)
+                assert k == self.current_task - 1, f"[error] fixed buffer share of task {k} missing: {path}"
+                q = max(1, round(cfg.buffer_fraction * n))
+                task_data = Subset(past_data, list(range(off, off + n)))
+                if mode in ("uniform", "task_stratified"):
+                    chosen = np.sort(rng.choice(n, size=q, replace=False))
+                elif mode == "kmeans":
+                    chosen = self._kmeans_selection(task_data, np.array([n]), np.array([0]), np.array([q]), rng, tag=f"fixed_task{k}")
+                elif mode == "rainbow":
+                    chosen = self._rainbow_selection(task_data, np.array([n]), np.array([0]), np.array([q]), tag=f"fixed_task{k}")
+                else:
+                    raise ValueError(f"[error] unknown lifelong.buffer_selection {mode}")
+                np.save(path, chosen.astype(np.int64))
+                print(f"[info] fixed buffer: task {k} share selected ({mode}), {q} of {n}")
+            chosen = np.load(path)
+            assert chosen.max() < n, f"[error] {path} does not fit task {k} ({n} samples)"
+            parts.append(off + chosen)
+            quotas.append(len(chosen))
+        print(f"[info] fixed buffer, per task {quotas}")
+        return np.concatenate(parts)
+
+    def _rainbow_selection(self, past_data, sizes, offsets, quotas, tag=None):
         t0 = time.time()
         self.policy.eval()
         try:
@@ -202,12 +250,12 @@ class RandER(ER):
             torch.cuda.empty_cache()
         out_dir = os.path.join(self.experiment_dir, "rainbow")
         os.makedirs(out_dir, exist_ok=True)
-        np.savez_compressed(os.path.join(out_dir, f"task{self.current_task}.npz"), quotas=quotas, **log)
+        np.savez_compressed(os.path.join(out_dir, f"{tag or f'task{self.current_task}'}.npz"), quotas=quotas, **log)
         self.replay_cost_selection_s = time.time() - t0
         print(f"[info] rainbow buffer, per task {quotas.tolist()}, selection {time.time() - t0:.0f} s")
         return np.concatenate(parts)
 
-    def _kmeans_selection(self, past_data, sizes, offsets, quotas, rng):
+    def _kmeans_selection(self, past_data, sizes, offsets, quotas, rng, tag=None):
         from libero.lifelong.algos.anchor_er import selection
 
         t0 = time.time()
@@ -238,7 +286,7 @@ class RandER(ER):
         torch.cuda.empty_cache()
         out_dir = os.path.join(self.experiment_dir, "kmeans")
         os.makedirs(out_dir, exist_ok=True)
-        np.savez_compressed(os.path.join(out_dir, f"task{self.current_task}.npz"), quotas=quotas, **log)
+        np.savez_compressed(os.path.join(out_dir, f"{tag or f'task{self.current_task}'}.npz"), quotas=quotas, **log)
         print(f"[info] kmeans buffer, per task {quotas.tolist()}, selection {time.time() - t0:.0f} s")
         return np.concatenate(parts)
 

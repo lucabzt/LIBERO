@@ -24,6 +24,10 @@ pool_n_per_task: null
 # disagreement within a task; Rainbow Memory with AnchorER's step-2 score) | kmeans (same quotas,
 # k-means on the obs latent within a task, equal share per cluster, random within a cluster)
 buffer_selection: uniform
+# true: no reselection: every task's share (max(1, round(buffer_fraction * task size))) is selected
+# once with buffer_selection, from that task's data only, at the start of the next task, and kept
+# (saved in <run>/fixed_buffer/task<k>.npy); false: the whole buffer is reselected at every task
+fixed_buffer: false
 # rainbow disagreement: AnchorER defaults (anchor_er.yaml)
 rainbow_noise_level: 20
 rainbow_inference_steps: 100
