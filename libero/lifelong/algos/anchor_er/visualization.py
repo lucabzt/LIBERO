@@ -1,7 +1,7 @@
 """
 Plots of an AnchorER selection, as the authors' SelectiveER logs: where in the trajectories
 the overlapping / disagreeing new data and the selected anchors lie, which past tasks the
-anchors come from, and image grids of the strongest disagreements and anchors.
+anchors come from.
 """
 
 import os
@@ -64,25 +64,3 @@ def plot_anchors(out_dir, anchor_task, anchor_t, task_names):
     axes[1].legend(fontsize=7)
     _save(fig, os.path.join(out_dir, "anchors.png"))
 
-
-def plot_image_grid(path, images, labels, title):
-    """Up to 100 images (H, W, 3) in [0, 1] in a 10 x 10 grid with a label each."""
-    n = min(100, len(images))
-    n_cols = 10
-    n_rows = max(1, int(np.ceil(n / n_cols)))
-    fig, axes = plt.subplots(n_rows, n_cols, figsize=(1.6 * n_cols, 1.75 * n_rows))
-    axes = np.atleast_2d(axes)
-    for i, ax in enumerate(axes.flat):
-        ax.axis("off")
-        if i < n:
-            ax.imshow(images[i])
-            ax.set_title(labels[i], fontsize=5)
-    fig.suptitle(title)
-    _save(fig, path)
-
-
-def frame(sample, key):
-    """First obs frame of a dataset sample as (H, W, 3); LIBERO renders upside down."""
-    img = sample["obs"][key][0]
-    img = img.numpy() if hasattr(img, "numpy") else np.asarray(img)
-    return np.clip(np.transpose(img, (1, 2, 0))[::-1, ::-1], 0, 1)

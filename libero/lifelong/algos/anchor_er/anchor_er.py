@@ -257,23 +257,7 @@ class AnchorER(RandER):
         try:
             visualization.plot_partition(out_dir, new_t, overlap_mask, od_idx)
             visualization.plot_anchors(out_dir, old_task[anchors], old_t[anchors], task_names)
-            rgb_key = self.cfg.data.obs.modality.rgb[0]
-            top = anchors[:100]
-            visualization.plot_image_grid(
-                os.path.join(out_dir, "top100_anchors.png"),
-                [visualization.frame(past_data[i], rgb_key) for i in top],
-                [f"T{old_task[i] + 1} t={old_t[i]} {scores[i]:.1f}" for i in top],
-                f"Best anchors for task {self.current_task + 1}: {info['new_task']}",
-            )
             if val_scores is not None:
                 visualization.plot_disagreement(out_dir, val_scores, overlap_scores, threshold)
-                order = np.argsort(-overlap_scores)[:100]
-                top_new = overlap_idx[order]
-                visualization.plot_image_grid(
-                    os.path.join(out_dir, "top100_disagreement.png"),
-                    [visualization.frame(self.current_dataset[i], rgb_key) for i in top_new],
-                    [f"t={new_t[i]} {s:.3f}" for i, s in zip(top_new, overlap_scores[order])],
-                    f"Strongest disagreement, task {self.current_task + 1}: {info['new_task']}",
-                )
         except Exception as e:
             print(f"[warning] AnchorER: could not plot the selection: {e!r}")

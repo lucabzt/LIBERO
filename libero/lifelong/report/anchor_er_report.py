@@ -357,13 +357,7 @@ def write_anchor_er_report(run_dir: str) -> str:
         lines += [
             f"![anchors]({d}/anchors.png)",
             "",
-            f"Image grids: [top 100 anchors]({d}/top100_anchors.png)"
-            + (
-                f", [top 100 disagreements]({d}/top100_disagreement.png)"
-                if os.path.isfile(os.path.join(output_dir, d, "top100_disagreement.png"))
-                else ""
-            )
-            + f". Raw data: [selection.json]({d}/selection.json), `{d}/selection.npz`.",
+            f"Raw data: [selection.json]({d}/selection.json), `{d}/selection.npz`.",
             "",
         ]
 
