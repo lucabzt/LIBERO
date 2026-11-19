@@ -29,6 +29,8 @@ class DiffusionPolicy(BasePolicy):
     obs key, so it is concatenated with the visual and proprio features. With
     policy.project_language it is first projected by policy.language_encoder
     (MLPEncoder, as in LIBERO's BC policies), trained with the policy.
+    With policy.use_language=false the task embedding is not an input at all (no obs key, not in
+    the global condition): the policy sees only the visual and proprio observations.
     """
 
     def __init__(self, cfg, shape_meta):
@@ -49,8 +51,9 @@ class DiffusionPolicy(BasePolicy):
 
         # default False: checkpoints from before this option have no projection
         self.language_encoder = None
+        self.use_language = bool(policy_cfg.get("use_language", True))
         task_emb_size = policy_cfg.language_encoder.network_kwargs.input_size
-        if policy_cfg.get("project_language", False):
+        if self.use_language and policy_cfg.get("project_language", False):
             self.language_encoder = eval(policy_cfg.language_encoder.network)(
                 **policy_cfg.language_encoder.network_kwargs
             )
@@ -69,11 +72,12 @@ class DiffusionPolicy(BasePolicy):
                 "type": "low_dim",
                 "horizon": self.n_obs_steps,
             }
-        obs_shape_meta[TASK_EMB_KEY] = {
-            "shape": [task_emb_size],
-            "type": "low_dim",
-            "horizon": 1,
-        }
+        if self.use_language:
+            obs_shape_meta[TASK_EMB_KEY] = {
+                "shape": [task_emb_size],
+                "type": "low_dim",
+                "horizon": 1,
+            }
         dp_shape_meta = {
             "obs": obs_shape_meta,
             "action": {
@@ -115,7 +119,8 @@ class DiffusionPolicy(BasePolicy):
                     "std": torch.tensor([0.5]),
                 },
             )
-        normalizer[TASK_EMB_KEY] = SingleFieldLinearNormalizer.create_identity()
+        if self.use_language:
+            normalizer[TASK_EMB_KEY] = SingleFieldLinearNormalizer.create_identity()
         for key in self.low_dim_keys + ["action"]:
             stats = cfg.normalizer_stats[key]
             # fitting 'limits' on just the min and max rows gives the same scale/offset
@@ -126,6 +131,8 @@ class DiffusionPolicy(BasePolicy):
 
     def _dp_obs(self, obs, task_emb):
         dp_obs = {key: obs[key] for key in self.rgb_keys + self.low_dim_keys}
+        if not self.use_language:
+            return dp_obs
         if self.language_encoder is not None:
             task_emb = self.language_encoder({"task_emb": task_emb})
         dp_obs[TASK_EMB_KEY] = task_emb.unsqueeze(1)
@@ -239,6 +246,22 @@ class DiffusionPolicy(BasePolicy):
             ood_metric=ood_metric,
             num_inference_steps=num_inference_steps,
             action_scale=action_scale,
+        )
+
+    @torch.no_grad()
+    def compute_action_disagreement_from_cond(
+        self, global_cond, actions, noise_level, ood_metric=None, num_inference_steps=None,
+        action_scale=None,
+    ):
+        """compute_action_disagreement for stored global conditions (B, D) and unnormalized action
+        chunks (B, horizon, action_dim) instead of a batch of raw obs (stale latent replay)."""
+        return self.dp.compute_ood_score(
+            {"action": actions},
+            noise_level=noise_level,
+            ood_metric=ood_metric,
+            num_inference_steps=num_inference_steps,
+            action_scale=action_scale,
+            global_cond=global_cond,
         )
 
     @torch.no_grad()

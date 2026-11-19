@@ -48,6 +48,10 @@ selection_device: cuda
 # true: latent replay (MLR): the buffer holds the frozen obs encoder's features (the U-Net's global
 # condition, center crop) and the action chunks instead of raw obs; needs policy.freeze_obs_encoder
 latent_replay: false
+# true: simple latent replay without freezing or pretraining: every task's data (incl. held-out
+# demos) is encoded once right after the task and only these stale latents are selected from
+# (anchors, disagreement baseline) and replayed; the obs encoder keeps training on the current task
+stale_latent_replay: false
 # replay DataLoader as in rand_er.yaml (true: endless random permutations, always full batches)
 continuous_replay_loader: false
 # only the first pool_n_per_task samples of every past task form the pool the buffer is drawn from

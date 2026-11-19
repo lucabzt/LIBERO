@@ -332,7 +332,7 @@ class DiffusionUnetTimmPolicy(BaseImagePolicy):
                 pass
 
     def compute_ood_score(self, batch, noise_level, do_stop = False, ood_metric = None,
-            num_inference_steps = None, action_scale = None):
+            num_inference_steps = None, action_scale = None, global_cond = None):
         # in: batch
         # out: OOD score per batch element
         # do_stop is a debugging technique
@@ -347,11 +347,13 @@ class DiffusionUnetTimmPolicy(BaseImagePolicy):
         # it adds the specified noise to the batch, then denoises it again and returns the denoised actions 
         with torch.no_grad():
             assert 'valid_mask' not in batch
-            nobs = self.normalizer.normalize(batch['obs'])
             nactions = self.normalizer['action'].normalize(batch['action'])
-            
+
             assert self.obs_as_global_cond
-            global_cond = self.obs_encoder(nobs)
+            # LIBERO: global_cond given = stored obs-encoder features (stale latent replay)
+            if global_cond is None:
+                nobs = self.normalizer.normalize(batch['obs'])
+                global_cond = self.obs_encoder(nobs)
 
             # HACK : features missing
             #   1) local conditioning 

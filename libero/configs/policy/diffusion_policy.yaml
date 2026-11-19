@@ -54,6 +54,9 @@ unet:
 # project the task embedding with language_encoder (MLPEncoder, trained with the policy) before
 # it is concatenated into the global condition, as LIBERO's BC policies do; false: raw embedding
 project_language: true
+# false: no task embedding at all (not an obs key, not in the global condition), the policy sees
+# only the visual and proprio observations (no-language ablation)
+use_language: true
 
 # BasePolicy builds these augmentations; DiffusionPolicy does not use them (it uses the
 # encoder's random crop).

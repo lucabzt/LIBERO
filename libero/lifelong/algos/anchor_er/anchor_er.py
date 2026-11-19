@@ -7,8 +7,28 @@ import torch
 from torch.utils.data import ConcatDataset, DataLoader, Subset
 
 from libero.lifelong.algos.anchor_er import selection, visualization
+from libero.lifelong.algos.base import Sequential
 from libero.lifelong.algos.rand_er import RandER
 from libero.lifelong.report.anchor_er_report import selection_percentages
+
+
+class StaleLatentPool:
+    """Past data stored only as stale latents (lifelong.stale_latent_replay): per sample the U-Net
+    global condition (N, D) computed once right after its task was learned, the unnormalized action
+    chunk (N, horizon, action_dim), its task id and timestep in the demo (CPU tensors / arrays)."""
+
+    def __init__(self, cond, actions, task, t):
+        self.cond, self.actions, self.task, self.t = cond, actions, task, t
+
+    def __len__(self):
+        return len(self.cond)
+
+    @classmethod
+    def concat(cls, parts):
+        return cls(
+            torch.cat([p.cond for p in parts]), torch.cat([p.actions for p in parts]),
+            np.concatenate([p.task for p in parts]), np.concatenate([p.t for p in parts]),
+        )
 
 
 class AnchorER(RandER):
@@ -33,6 +53,15 @@ class AnchorER(RandER):
 
     Selection results and plots are written to <experiment_dir>/anchorER/task<k>/; main.py
     summarizes them in anchorER/report.md (libero/lifelong/report/anchor_er_report.py).
+
+    lifelong.stale_latent_replay (simple latent replay without pretraining or freezing): at the
+    start of task k the training and held-out data of task k-1 are encoded once with the policy
+    after task k-1 (eval mode, center crop) into U-Net global conditions + action chunks
+    (<experiment_dir>/stale_latents/task<k-1>.pt) and never re-encoded. Past data exists only as
+    these stale latents: the selection uses them for the past side (representations = the stored
+    condition split by obs key, disagreement baseline = held-out latents denoised by the current
+    U-Net), and the buffer replays them (RandER's latent replay path: the current-task batch goes
+    through the obs encoder, which keeps training, the replayed latents only into the U-Net).
     """
 
     def __init__(self, n_tasks, cfg, **policy_kwargs):
@@ -47,6 +76,94 @@ class AnchorER(RandER):
         self.current_dataset = dataset
         self.benchmark = benchmark
         return super().learn_one_task(dataset, task_id, benchmark, result_summary)
+
+    # ------------------------------------------------------------------
+    # stale latent replay
+    # ------------------------------------------------------------------
+    def start_task(self, task):
+        cfg = self.cfg.lifelong
+        if not cfg.get("stale_latent_replay", False):
+            return super().start_task(task)
+        assert not cfg.get("latent_replay", False), "[error] stale_latent_replay replaces latent_replay"
+        assert cfg.get("n_memories") is None and not cfg.get("buffer_indices_file")
+        assert cfg.get("pool_n_per_task") is None
+        Sequential.start_task(self, task)  # as RandER: no ER buffers
+        if self.current_task == 0:
+            return
+        self._encode_stale(self.current_task - 1)
+        pool = StaleLatentPool.concat([self._load_stale(k)["train"] for k in range(self.current_task)])
+        n_memories = max(1, round(cfg.buffer_fraction * len(pool)))
+        rng = np.random.default_rng(self.cfg.seed + task)
+        indices = torch.as_tensor(self.select_buffer(pool, n_memories, rng), dtype=torch.long)
+        device = torch.device(self.cfg.device)
+        self.latent_cond = pool.cond[indices].to(device).contiguous()
+        self.latent_actions = pool.actions[indices].to(device).contiguous()
+        self.latent_generator = torch.Generator(device=self.latent_cond.device)
+        self.latent_generator.manual_seed(self.cfg.seed + task)
+        self.latent_perm, self.latent_pos = None, 0
+        self.replay_batch_size = max(1, round(cfg.get("replay_ratio", 1.0) * self.cfg.train.batch_size))
+        self.buffer = None  # observe takes RandER's latent path
+        self.replay_cost = {"n_buffer": int(n_memories), "n_past": int(len(pool))}
+        self.replay_cost.update(self._buffer_bytes(raw=False))
+        self.replay_cost["latent_dim"] = int(self.latent_cond.shape[1])
+        print(
+            f"[info] AnchorER stale latent buffer: {n_memories} of {len(pool)} past samples, "
+            f"global cond dim {self.latent_cond.shape[1]}"
+        )
+
+    def _stale_file(self, k):
+        return os.path.join(self.experiment_dir, "stale_latents", f"task{k}.pt")
+
+    @torch.no_grad()
+    def _encode_part(self, dataset, k):
+        conds, actions = [], []
+        for data in self._loader(dataset):
+            cond, act = self.policy.encode_latents(self.map_tensor_to_device(data))
+            conds.append(cond.float().cpu())
+            actions.append(act.float().cpu())
+        seq = dataset.sequence_dataset
+        t = np.array([i - seq._demo_id_to_start_indices[seq._index_to_demo_id[i]] for i in range(len(dataset))])
+        return StaleLatentPool(torch.cat(conds), torch.cat(actions), np.full(len(dataset), k), t)
+
+    def _encode_stale(self, k):
+        """Stale latents of task k with the current policy (= the policy right after task k, also
+        on resume: main.py loads task<k>_model.pth). Skipped if they exist (resume)."""
+        path = self._stale_file(k)
+        if os.path.exists(path):
+            return
+        assert all(os.path.exists(self._stale_file(j)) for j in range(k)), (
+            f"[error] stale latents of tasks before {k} missing: they can only be encoded right after their task"
+        )
+        assert self.val_datasets is not None and self.val_datasets[k] is not None, (
+            "[error] stale_latent_replay needs held-out demos (data.n_val_demos > 0)"
+        )
+        t0 = time.time()
+        was_training = self.policy.training
+        self.policy.eval()  # center crop, as at test time
+        try:
+            parts = {"train": self._encode_part(self.datasets[k], k),
+                     "val": self._encode_part(self.val_datasets[k], k)}
+        finally:
+            self.policy.train(was_training)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        torch.save({name: vars(p) for name, p in parts.items()}, path + ".tmp")
+        os.replace(path + ".tmp", path)
+        print(
+            f"[info] stale latents of task {k}: {len(parts['train'])} train + {len(parts['val'])} "
+            f"held-out samples, dim {parts['train'].cond.shape[1]}, {time.time() - t0:.0f} s"
+        )
+
+    def _load_stale(self, k):
+        try:
+            d = torch.load(self._stale_file(k), weights_only=False)
+        except TypeError:  # torch < 1.13 has no weights_only
+            d = torch.load(self._stale_file(k))
+        return {name: StaleLatentPool(**v) for name, v in d.items()}
+
+    def _val_data(self, task):
+        if self.cfg.lifelong.get("stale_latent_replay", False):
+            return StaleLatentPool.concat([self._load_stale(k)["val"] for k in range(task)])
+        return ConcatDataset(self.val_datasets[:task])
 
     def select_buffer(self, past_data, n_memories, rng):
         out_dir = os.path.join(self.experiment_dir, "anchorER", f"task{self.current_task}")
@@ -70,6 +187,12 @@ class AnchorER(RandER):
 
     def _representations(self, dataset):
         device = torch.device(self.cfg.lifelong.selection_device)
+        if isinstance(dataset, StaleLatentPool):
+            # the stored condition is the per-key features concatenated in this order
+            dims = self.policy.latent_dims()
+            assert sum(dims.values()) == dataset.cond.shape[1]
+            parts = torch.split(dataset.cond, list(dims.values()), dim=1)
+            return {key: part.float().to(device) for key, part in zip(dims, parts)}
         reprs = {}
         for data in self._loader(dataset):
             data = self.map_tensor_to_device(data)
@@ -80,6 +203,24 @@ class AnchorER(RandER):
     def _disagreement(self, dataset):
         cfg = self.cfg.lifelong
         scores = []
+        if isinstance(dataset, StaleLatentPool):
+            device = torch.device(self.cfg.device)
+            bs = cfg.selection_batch_size
+            for i in range(0, len(dataset), bs):
+                cond = dataset.cond[i:i + bs].to(device)
+                actions = dataset.actions[i:i + bs].to(device)
+                draws = [
+                    self.policy.compute_action_disagreement_from_cond(
+                        cond, actions,
+                        noise_level=cfg.noise_level,
+                        ood_metric=cfg.disagreement_metric,
+                        num_inference_steps=cfg.disagreement_inference_steps,
+                        action_scale=cfg.action_scale if cfg.disagreement_metric == "se3" else None,
+                    )
+                    for _ in range(cfg.n_noise_samples)
+                ]
+                scores.append(torch.stack(draws, dim=0).mean(dim=0).cpu())
+            return torch.cat(scores, dim=0).numpy()
         for data in self._loader(dataset):
             data = self.map_tensor_to_device(data)
             draws = [
@@ -146,7 +287,7 @@ class AnchorER(RandER):
             assert self.val_datasets is not None and all(
                 ds is not None for ds in self.val_datasets[:task]
             ), "[error] AnchorER action disagreement needs held-out demos (data.n_val_demos > 0)"
-            val_scores = self._disagreement(ConcatDataset(self.val_datasets[:task]))
+            val_scores = self._disagreement(self._val_data(task))
             overlap_scores = self._disagreement(Subset(self.current_dataset, overlap_idx.tolist()))
             mu, sigma = float(val_scores.mean()), float(val_scores.std(ddof=1))
             threshold = mu + cfg.std_cutoff * sigma
@@ -208,6 +349,8 @@ class AnchorER(RandER):
 
     def _sample_info(self, datasets):
         """(task, timestep in demo) of every index of datasets (one or a ConcatDataset)."""
+        if isinstance(datasets, StaleLatentPool):
+            return datasets.task, datasets.t
         tasks, steps = [], []
         if isinstance(datasets, ConcatDataset):
             parts = list(enumerate(datasets.datasets))
