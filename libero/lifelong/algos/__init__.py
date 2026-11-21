@@ -8,3 +8,4 @@ from libero.lifelong.algos.ewc import EWC
 from libero.lifelong.algos.packnet import PackNet
 from libero.lifelong.algos.single_task import SingleTask
 from libero.lifelong.algos.hybrid_er import HybridER
+from libero.lifelong.algos.seed_drift_er import SeedDriftER

@@ -44,7 +44,7 @@ from libero.lifelong.utils import (
 
 
 # algorithms whose state after a task is fully given by the policy checkpoint and end_task
-RESUMABLE_ALGOS = ["Sequential", "SingleTask", "ER", "RandER", "AnchorER", "HybridER"]
+RESUMABLE_ALGOS = ["Sequential", "SingleTask", "ER", "RandER", "AnchorER", "HybridER", "SeedDriftER"]
 
 
 def save_report(experiment_dir, generic=True):

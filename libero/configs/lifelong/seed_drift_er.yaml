@@ -1,0 +1,28 @@
+# SeedDriftER (algos/seed_drift_er.py): latent replay with seeded drift compensation, no pretraining,
+# the obs encoder keeps training. Every past task: seed_fraction of its samples raw (k-means medoids
+# of its latents at the end of the task), all others as latents stored at the end of the task.
+algo: SeedDriftER
+seed_fraction: 0.01
+kmeans_n_init: 3
+# raw seeds per current-task sample in every batch (through the encoder, with gradient; as RandER 1%)
+replay_ratio: 1.0
+# stored (compensated) latents per current-task sample in every batch (U-Net only)
+latent_replay_ratio: 1.0
+# none (stale latents, control) | seed_offset (F_t(s) + F_j(x) - F_j(s)) |
+# seed_offset_map (F_t(s) + (F_j(x) - F_j(s)) W_j, W_j ridge map fit on task j's seeds, F_j -> F_t) |
+# seed_offset_grad (as seed_offset, F_t(s) from the raw seed replay of the same step, with encoder gradient;
+# one random cluster member per replayed seed as offset latent, latent_replay_ratio / refit_every unused)
+drift_compensation: seed_offset_map
+# kmeans (medoids of the image latents) | temporal (evenly spread over the demos, members = time segment)
+seed_selection: kmeans
+# offset generator per task (drift_compensation=gen_grad): none | cond (offset given seed, proprio, action, dt)
+# | joint (offset, action, proprio given seed, dt; nothing stored per sample)
+generator: none
+gen_width: 1024
+gen_pca: 256
+gen_train_steps: 6000
+gen_sample_steps: 20
+# re-encode the seeds and rebuild the replayed latents every refit_every training steps
+refit_every: 200
+# ridge strength toward the identity, relative to the mean eigenvalue of X^T X of the seeds
+ridge_alpha: 1.0
