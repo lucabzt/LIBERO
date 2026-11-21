@@ -230,6 +230,8 @@ class SeedDriftER(ER):
         else:
             t0 = time.time()
             old_C = torch.cat([self._shared_gen_data(e)[1] for e in self.store[:task_id]]) if task_id > 0 else None
+            for q in self.shared_gen.parameters():  # frozen after the previous stage
+                q.requires_grad_(True)
             loss = self.shared_gen.fit_task(d, C, old_C, lc.gen_train_steps, lc.get("gen_new_task_share", 0.5),
                                             lc.gen_sample_steps, seed=self.cfg.seed * 1000 + task_id)
             torch.save(self.shared_gen.state_dict(), path)
