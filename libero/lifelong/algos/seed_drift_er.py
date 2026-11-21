@@ -9,7 +9,7 @@ from torch.utils.data import DataLoader, Subset
 
 from libero.lifelong.algos.base import Sequential
 from libero.lifelong.algos.er import ER, merge_datas
-from libero.lifelong.algos.offset_generator import OffsetGenerator, smooth_action_chunks
+from libero.lifelong.algos.offset_generator import OffsetGenerator, SharedOffsetGenerator, smooth_action_chunks
 from libero.lifelong.algos.rand_er import EndlessRandomSampler
 
 
@@ -132,6 +132,7 @@ class SeedDriftER(ER):
         super().__init__(n_tasks=n_tasks, cfg=cfg, **policy_kwargs)
         self.store = []  # per past task: dict(cond, actions, seeds, assign, dt)
         self.generators = []  # per past task: OffsetGenerator (lifelong.generator != none)
+        self.shared_gen = None  # SharedOffsetGenerator of all past tasks (lifelong.gen_shared)
         self.seed_loader = None
         self.n_steps = 0
         self.replay_cost = {}
@@ -187,15 +188,56 @@ class SeedDriftER(ER):
                   f"{len(seeds)} {self.cfg.lifelong.get('seed_selection', 'kmeans')} seeds raw ({len(seeds) / X.shape[0]:.2%}), {time.time() - t0:.0f} s")
         self.store.append(entry)
         if self.cfg.lifelong.get("generator", "none") != "none":
-            self.generators.append(self._fit_generator(entry, task_id))
+            if self.cfg.lifelong.get("gen_shared", False):
+                self._fit_shared_generator(task_id)
+            else:
+                self.generators.append(self._fit_generator(entry, task_id))
 
-    def _gen_inputs(self, z_seed, prop, act_flat, dt):
-        """Generator condition: seed latent F_j(s), (proprio, action if conditional), dt."""
+    def _gen_inputs(self, z_seed, prop, act_flat, dt, temb=None):
+        """Generator condition: seed latent F_j(s), (proprio, action if conditional), dt, (task embedding if shared)."""
         parts = [z_seed]
         if self.cfg.lifelong.generator == "cond":
             parts += [prop, act_flat]
         parts.append(dt[:, None])
+        if temb is not None:
+            parts.append(temb)
         return torch.cat(parts, 1)
+
+    def _shared_gen_data(self, e):
+        """Offsets and shared-generator conditions of an entry's non-seed samples."""
+        R, P = self._image_dim(), self._prop_dim()
+        ns = self._nonseed(e)
+        img = e["cond"][:, :R]
+        zs = img[e["seeds"]][e["assign"]]
+        act = e["actions"].reshape(len(e["actions"]), -1)
+        C = self._gen_inputs(zs, e["cond"][:, R:R + P], act, e["dt"], e["cond"][:, R + P:])
+        return (img - zs)[ns], C[ns]
+
+    def _fit_shared_generator(self, task_id):
+        """Stage task_id of the continual shared generator (one network, per-task PCA bases, self-replay)."""
+        lc = self.cfg.lifelong
+        R = self._image_dim()
+        path = os.path.join(self.experiment_dir, "seed_drift", f"gen_shared_task{task_id}.pt")
+        d, C = self._shared_gen_data(self.store[task_id])
+        dev = d.device
+        if self.shared_gen is None:
+            self.shared_gen = SharedOffsetGenerator(R, C.shape[1] - R, lc.gen_pca, lc.gen_width).to(dev)
+        if os.path.exists(path):
+            self.shared_gen.ensure_bases(task_id + 1, dev)
+            self.shared_gen.load_state_dict(torch.load(path, map_location=dev))
+            self.shared_gen.eval()
+            print(f"[info] SeedDriftER: shared generator after task {task_id} loaded from {path}")
+        else:
+            t0 = time.time()
+            old_C = torch.cat([self._shared_gen_data(e)[1] for e in self.store[:task_id]]) if task_id > 0 else None
+            loss = self.shared_gen.fit_task(d, C, old_C, lc.gen_train_steps, lc.get("gen_new_task_share", 0.5),
+                                            lc.gen_sample_steps, seed=self.cfg.seed * 1000 + task_id)
+            torch.save(self.shared_gen.state_dict(), path)
+            print(f"[info] SeedDriftER: shared generator stage {task_id} ({len(d)} real + "
+                  f"{0 if old_C is None else len(old_C)} self-replayed samples): "
+                  f"{self.shared_gen.storage_bytes() / 1e6:.1f} MB fp16, final loss {loss:.3f}, {time.time() - t0:.0f} s")
+        for q in self.shared_gen.parameters():
+            q.requires_grad_(False)
 
     def _fit_generator(self, e, task_id):
         R, P = self._image_dim(), self._prop_dim()
@@ -287,8 +329,8 @@ class SeedDriftER(ER):
             "buffer_bytes": int(n_seed * raw_b + (n_seed + n_lat) * lat_b),
             "buffer_bytes_if_all_raw": int((n_seed + n_lat) * raw_b),
         }
-        if self.generators:
-            gen_b = sum(g.storage_bytes() for g in self.generators)
+        if self.generators or self.shared_gen is not None:
+            gen_b = self.shared_gen.storage_bytes() if self.shared_gen is not None else sum(g.storage_bytes() for g in self.generators)
             side = 0 if self.cfg.lifelong.generator == "joint" else 2 * (self._prop_dim() + self.lat_actions[0].numel())
             self.replay_cost.update({
                 "generator_bytes_fp16": int(gen_b), "side_bytes_per_sample_fp16": int(side),
@@ -389,9 +431,14 @@ class SeedDriftER(ER):
         for j in torch.unique(task).tolist():
             m = task == j
             mm = mem[m]
+            shared = self.shared_gen is not None
             C = self._gen_inputs(self.seed_stale[self.lat_seed[mm]], self.lat_low[mm][:, :P],
-                                 self.lat_actions[mm].reshape(len(mm), -1), self.lat_dt[mm])
-            d, a, p = self.generators[j].sample(C, self.cfg.lifelong.gen_sample_steps, self.lat_gen)
+                                 self.lat_actions[mm].reshape(len(mm), -1), self.lat_dt[mm],
+                                 self.lat_low[mm][:, P:] if shared else None)
+            if shared:
+                d, a, p = self.shared_gen.sample(C, j, self.cfg.lifelong.gen_sample_steps, self.lat_gen), None, None
+            else:
+                d, a, p = self.generators[j].sample(C, self.cfg.lifelong.gen_sample_steps, self.lat_gen)
             off[m] = d
             if joint:
                 act[m], prop[m] = a, p

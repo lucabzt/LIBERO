@@ -25,6 +25,11 @@ gen_sample_steps: 20
 # joint generator: low-pass the generated arm actions to the first gen_action_dct_keep DCT coefficients along
 # the chunk and snap the gripper to +-1 (0: off); generated chunks are jittery with a blurred gripper
 gen_action_dct_keep: 0
+# one continual shared generator for all past tasks (SharedOffsetGenerator, generator=cond): per-task PCA
+# bases, task embedding as condition, at the end of every task gen_train_steps steps on the new task's
+# offsets + self-replay of all earlier tasks, the new task repeated to about gen_new_task_share of the mix
+gen_shared: false
+gen_new_task_share: 0.5
 # re-encode the seeds and rebuild the replayed latents every refit_every training steps
 refit_every: 200
 # ridge strength toward the identity, relative to the mean eigenvalue of X^T X of the seeds
