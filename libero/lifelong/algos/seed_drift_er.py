@@ -9,7 +9,7 @@ from torch.utils.data import DataLoader, Subset
 
 from libero.lifelong.algos.base import Sequential
 from libero.lifelong.algos.er import ER, merge_datas
-from libero.lifelong.algos.offset_generator import OffsetGenerator
+from libero.lifelong.algos.offset_generator import OffsetGenerator, smooth_action_chunks
 from libero.lifelong.algos.rand_er import EndlessRandomSampler
 
 
@@ -424,6 +424,9 @@ class SeedDriftER(ER):
                 off, a_gen, p_gen = self._generate(mem)
                 if a_gen is not None:  # joint: generated action chunk and proprio
                     lat_act = a_gen.reshape(lat_act.shape)
+                    keep = self.cfg.lifelong.get("gen_action_dct_keep", 0)
+                    if keep > 0:
+                        lat_act = smooth_action_chunks(lat_act, keep)
                     low = torch.cat([p_gen, low[:, self._prop_dim():]], 1)
             else:
                 off = self._step_offsets(mode, mem)

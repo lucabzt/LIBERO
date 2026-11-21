@@ -20,6 +20,20 @@ def time_emb(t, dim=32):
     return torch.cat([torch.sin(t[:, None] * f), torch.cos(t[:, None] * f)], 1)
 
 
+def smooth_action_chunks(a, keep):
+    """
+    Action chunks (B, T, 7) with the arm dims low-passed along the chunk (first `keep` DCT coefficients) and the
+    gripper snapped to +-1. Generated chunks carry independent noise per timestep and a blurred gripper command
+    (experiments/2026-11-21_generator_failure); recorded chunks are smooth and their gripper is +-1.
+    """
+    T = a.shape[1]
+    t = torch.arange(T, device=a.device, dtype=a.dtype)
+    D = torch.cos(math.pi / T * (t[None, :] + 0.5) * t[:, None])
+    D = (D / D.norm(dim=1, keepdim=True))[:keep]
+    arm = torch.einsum("kt,bkd->btd", D, torch.einsum("kt,btd->bkd", D, a[..., :6]))
+    return torch.cat([arm, torch.sign(a[..., 6:])], -1)
+
+
 class ResMLP(nn.Module):
     def __init__(self, d_in, d_cond, d_out, width, blocks=4):
         super().__init__()

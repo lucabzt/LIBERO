@@ -22,6 +22,9 @@ gen_width: 1024
 gen_pca: 256
 gen_train_steps: 6000
 gen_sample_steps: 20
+# joint generator: low-pass the generated arm actions to the first gen_action_dct_keep DCT coefficients along
+# the chunk and snap the gripper to +-1 (0: off); generated chunks are jittery with a blurred gripper
+gen_action_dct_keep: 0
 # re-encode the seeds and rebuild the replayed latents every refit_every training steps
 refit_every: 200
 # ridge strength toward the identity, relative to the mean eigenvalue of X^T X of the seeds
