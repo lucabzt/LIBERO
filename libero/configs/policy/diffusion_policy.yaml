@@ -36,7 +36,11 @@ obs_encoder:
   use_group_norm: true
   share_rgb_model: false
   imagenet_norm: false
+  # spatial_embedding (512 per camera and frame) | spatial_softmax (robomimic-style head of Memory Anchors:
+  # num_keypoints keypoints -> keypoint_out_dim per camera and frame, 256-d image latent instead of 2048)
   feature_aggregation: spatial_embedding
+  num_keypoints: 32
+  keypoint_out_dim: 64
   downsample_ratio: 32
 
 unet:

@@ -50,6 +50,26 @@ class AttentionPool2d(nn.Module):
         return x.squeeze(0)
     
 
+class SpatialSoftmax(nn.Module):
+    """
+    Robomimic-style image head (as RobomimicDiffusionObsEncoder of Memory Anchors): 1x1 conv to num_keypoints
+    heatmaps, softmax over the feature map, expected (x, y) of every keypoint, linear projection to out_dim.
+    """
+
+    def __init__(self, in_channels, feature_map_shape, num_keypoints, out_dim):
+        super().__init__()
+        self.keypoint_conv = nn.Conv2d(in_channels, num_keypoints, kernel_size=1)
+        h, w = feature_map_shape
+        ys, xs = torch.meshgrid(torch.linspace(-1, 1, h), torch.linspace(-1, 1, w), indexing="ij")
+        self.register_buffer("grid", torch.stack([xs.flatten(), ys.flatten()], dim=1))  # (H*W, 2)
+        self.proj = nn.Linear(2 * num_keypoints, out_dim)
+
+    def forward(self, x):
+        attention = F.softmax(self.keypoint_conv(x).flatten(2), dim=-1)  # B, K, H*W
+        keypoints = attention @ self.grid  # B, K, 2
+        return self.proj(keypoints.flatten(1))
+
+
 class TimmObsEncoder(ModuleAttrMixin):
     def __init__(self,
             shape_meta: dict,
@@ -68,7 +88,9 @@ class TimmObsEncoder(ModuleAttrMixin):
             feature_aggregation: str='spatial_embedding',
             downsample_ratio: int=32,
             position_encording: str='learnable',
-
+            # feature_aggregation=spatial_softmax: keypoints and output dims per camera and frame
+            num_keypoints: int=32,
+            keypoint_out_dim: int=64,
         ):
         """
         Assumes rgb input: B,T,C,H,W
@@ -173,6 +195,12 @@ class TimmObsEncoder(ModuleAttrMixin):
                 raise RuntimeError(f"Unsupported obs type: {type}")
         
         feature_map_shape = [x // downsample_ratio for x in image_shape]
+        if feature_aggregation == 'spatial_softmax':
+            # a head per camera, appended to its model (one shared head if share_rgb_model)
+            head = SpatialSoftmax(feature_dim, feature_map_shape, num_keypoints, keypoint_out_dim)
+            for key in rgb_keys:
+                this_head = head if share_rgb_model else copy.deepcopy(head)
+                key_model_map[key] = nn.Sequential(key_model_map[key], this_head)
             
         rgb_keys = sorted(rgb_keys)
         low_dim_keys = sorted(low_dim_keys)
@@ -234,6 +262,9 @@ class TimmObsEncoder(ModuleAttrMixin):
             assert self.feature_aggregation is None # vit uses the CLS token
             return feature[:, 0, :]
         
+        if self.feature_aggregation == 'spatial_softmax':
+            return feature  # the camera's model ends in its SpatialSoftmax head
+
         # resnet
         assert len(feature.shape) == 4
         if self.feature_aggregation == 'attention_pool_2d':
