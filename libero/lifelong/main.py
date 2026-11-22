@@ -57,9 +57,12 @@ def final_eval_lock():
         return
     with open(path, "a") as f:
         t0 = time.time()
-        fcntl.flock(f, fcntl.LOCK_EX)
-        if time.time() - t0 > 5:
-            print(f"[info] waited {(time.time() - t0) / 60:.1f} min for another run's final evaluation")
+        try:
+            fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            print("[info] waiting for another run's final evaluation (eval lock)", flush=True)
+            fcntl.flock(f, fcntl.LOCK_EX)
+            print(f"[info] waited {(time.time() - t0) / 60:.1f} min for another run's final evaluation", flush=True)
         try:
             yield
         finally:
