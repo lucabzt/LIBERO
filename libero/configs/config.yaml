@@ -19,6 +19,7 @@ output_dir: null # use default path (./experiments*)
 load_previous_model: false
 device: "cuda"
 task_embedding_format: "bert"
+# task_embedding_format=task_id: one-hot task index (no language model; "one-hot" embeds "Task <i>" with BERT)
 # task_embedding_format=precomputed: {instruction: embedding} file (relative to libero/lifelong), e.g.
 # task_embeddings/libero_goal_sentence-t5-base.pt
 task_embedding_file: null

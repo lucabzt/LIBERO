@@ -127,6 +127,8 @@ def create_experiment_dir(cfg, reuse_latest=False):
         prefix += f"_roberta"
     if cfg.task_embedding_format == "precomputed":
         prefix += f"_precomputed"
+    if cfg.task_embedding_format == "task_id":
+        prefix += f"_taskid"
 
     # NEW: add an output dir parameter to save whereever you want
     output_dir = cfg.output_dir if cfg.output_dir is not None else f"./{prefix}"
@@ -226,6 +228,10 @@ def get_task_embs(cfg, descriptions):
             return_tensors="pt",  # ask the function to return PyTorch tensors
         )
         task_embs = model(**tokens)["pooler_output"].detach()
+    elif cfg.task_embedding_format == "task_id":
+        # one-hot task id: index of the task in the run's task list, no language model (unlike "one-hot", which
+        # embeds the text "Task <i>" with BERT)
+        task_embs = torch.eye(len(descriptions))
     elif cfg.task_embedding_format == "precomputed":
         # {instruction: embedding} from scripts/precompute_task_embeddings.py (e.g. sentence-T5 as in Memory
         # Anchors); task_embedding_file relative to libero/lifelong unless absolute
