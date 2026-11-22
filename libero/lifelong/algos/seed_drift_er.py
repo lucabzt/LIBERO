@@ -292,7 +292,7 @@ class SeedDriftER(ER):
 
         # replayed latents: the non-seed samples of all past tasks
         R = self._image_dim()
-        off, low, acts, task_of, seed_of = [], [], [], [], []
+        off, low, acts, task_of, seed_of, sample_of = [], [], [], [], [], []
         seed_base = 0
         self.seed_task, self.seed_stale = [], []
         for j, e in enumerate(self.store):
@@ -305,12 +305,14 @@ class SeedDriftER(ER):
             acts.append(e["actions"][nonseed])
             task_of.append(torch.full((int(nonseed.sum()),), j, device=dev))
             seed_of.append(e["assign"][nonseed] + seed_base)
+            sample_of.append(torch.nonzero(nonseed).squeeze(1))
             self.seed_task.append(torch.full((len(e["seeds"]),), j, device=dev))
             self.seed_stale.append(s_img)
             seed_base += len(e["seeds"])
         self.lat_off, self.lat_low = torch.cat(off), torch.cat(low)
         self.lat_actions, self.lat_task, self.lat_seed = torch.cat(acts), torch.cat(task_of), torch.cat(seed_of)
         self.lat_dt = torch.cat([e["dt"][self._nonseed(e)] for e in self.store])
+        self.lat_sample = torch.cat(sample_of)  # index of every replayed latent in its task's dataset
         self.seed_task, self.seed_stale = torch.cat(self.seed_task), torch.cat(self.seed_stale)
         self.lat_gen = torch.Generator(device=dev).manual_seed(self.cfg.seed + task)
         # non-seed members of every seed's cluster (seed_offset_grad draws one per replayed seed)
@@ -339,6 +341,9 @@ class SeedDriftER(ER):
                 "buffer_bytes_generator": int(n_seed * raw_b + n_seed * 2 * R + n_lat * (side + 2) + gen_b)})
             print(f"[info] SeedDriftER generator storage: {gen_b / 1e6:.1f} MB generators + {side} B/sample "
                   f"side info, total {self.replay_cost['buffer_bytes_generator'] / 1e6:.1f} MB")
+        n_save = self.cfg.lifelong.get("gen_save_samples", 0)
+        if n_save > 0 and (self.generators or self.shared_gen is not None):
+            self._save_generated_samples(task, n_save)
         print(f"[info] SeedDriftER: {n_seed} raw seeds + {n_lat} latents of {task} past tasks, "
               f"compensation {self.cfg.lifelong.drift_compensation}, "
               f"{self.replay_cost['buffer_bytes'] / 1e6:.1f} MB (all raw: "
@@ -422,8 +427,35 @@ class SeedDriftER(ER):
         raise ValueError(f"[error] unknown lifelong.drift_compensation {mode}")
 
     @torch.no_grad()
-    def _generate(self, mem):
+    def _save_generated_samples(self, task, n):
+        """
+        For analysis (lifelong.gen_save_samples): per past task j, n random replayed (non-seed) samples with the
+        generated and the true offset (F_j space), and the latent they are replayed as, F_t(s) + d_gen, next to the
+        true current latent F_t(x) (image part, encoder at the start of task t, eval mode). Own RNG, so the
+        training's random stream is unchanged. -> seed_drift/generated_task<t>.pt
+        """
+        R = self._image_dim()
+        g = torch.Generator(device=self.lat_off.device).manual_seed(self.cfg.seed * 1000 + 777 + task)
+        out = {}
+        for j, e in enumerate(self.store):
+            idx = torch.nonzero(self.lat_task == j).squeeze(1)
+            mem = idx[torch.randperm(len(idx), generator=g, device=idx.device)[:n]]
+            sample = self.lat_sample[mem]
+            seed_sample = e["seeds"][e["assign"][sample]]
+            d_gen = self._generate(mem, generator=g)[0]
+            z_x = self._encode(Subset(self.datasets[j], sample.cpu().tolist()))[0][:, :R]
+            z_s = self._encode(Subset(self.datasets[j], seed_sample.cpu().tolist()))[0][:, :R]
+            out[j] = {"sample": sample.cpu(), "seed_sample": seed_sample.cpu(), "d_gen": d_gen.cpu(),
+                      "d_true": self.lat_off[mem].cpu(), "z_seed_t": z_s.cpu(), "z_true_t": z_x.cpu(),
+                      "actions": self.lat_actions[mem].cpu()}
+        path = os.path.join(self.experiment_dir, "seed_drift", f"generated_task{task}.pt")
+        torch.save(out, path)
+        print(f"[info] SeedDriftER: {n} generated replay samples per past task saved to {path}")
+
+    @torch.no_grad()
+    def _generate(self, mem, generator=None):
         """Generated offsets, flat actions and proprio (the latter two None for conditional generators)."""
+        generator = self.lat_gen if generator is None else generator
         R, P = self._image_dim(), self._prop_dim()
         joint = self.cfg.lifelong.generator == "joint"
         off = torch.empty_like(self.lat_off[mem])
@@ -438,9 +470,9 @@ class SeedDriftER(ER):
                                  self.lat_actions[mm].reshape(len(mm), -1), self.lat_dt[mm],
                                  self.lat_low[mm][:, P:] if shared else None)
             if shared:
-                d, a, p = self.shared_gen.sample(C, j, self.cfg.lifelong.gen_sample_steps, self.lat_gen), None, None
+                d, a, p = self.shared_gen.sample(C, j, self.cfg.lifelong.gen_sample_steps, generator), None, None
             else:
-                d, a, p = self.generators[j].sample(C, self.cfg.lifelong.gen_sample_steps, self.lat_gen)
+                d, a, p = self.generators[j].sample(C, self.cfg.lifelong.gen_sample_steps, generator)
             off[m] = d
             if joint:
                 act[m], prop[m] = a, p

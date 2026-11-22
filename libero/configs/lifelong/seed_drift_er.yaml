@@ -30,6 +30,10 @@ gen_action_dct_keep: 0
 # offsets + self-replay of all earlier tasks, the new task repeated to about gen_new_task_share of the mix
 gen_shared: false
 gen_new_task_share: 0.5
+# gen_pca=0 with gen_shared: no PCA bases, offsets standardized with the first task's statistics (small latents)
+# for analysis: at the start of every task save gen_save_samples generated replay samples per past task
+# (generated / true offsets, replayed / true current latents) to seed_drift/generated_task<t>.pt (0: off)
+gen_save_samples: 0
 # re-encode the seeds and rebuild the replayed latents every refit_every training steps
 refit_every: 200
 # ridge strength toward the identity, relative to the mean eigenvalue of X^T X of the seeds

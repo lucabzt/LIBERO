@@ -146,15 +146,18 @@ class SharedOffsetGenerator(nn.Module):
     One conditional generator of seed offsets for all past tasks (lifelong.gen_shared), trained continually: at
     the end of task j on task j's offsets plus its own samples for all earlier tasks (self-replay; their conditions
     are stored), task j's real samples repeated to about new_task_share of the mix. Offsets are generated in
-    per-task whitened PCA bases (fit when the task ends, 2 * n_pca * R bytes each); the condition carries the task
-    embedding. Offline: experiments/2026-11-21_offset_generator_study/shared_study.py --continual --pca_per_task.
+    per-task whitened PCA bases (fit when the task ends, 2 * n_pca * R bytes each), or with n_pca=0 directly in the
+    offset space, standardized per dimension with the first task's statistics (no bases; works for small latents such
+    as the 256-d spatial softmax one, not for 2048-d); the condition carries the task embedding.
+    Offline: experiments/2026-11-21_offset_generator_study/shared_study.py --continual (--pca_per_task | --pca 0).
     """
 
     def __init__(self, R, d_cond_rest, n_pca, width, d_seed=256):
         super().__init__()
         self.R, self.n_pca, self.n_tasks = R, n_pca, 0
+        self.d_out = n_pca if n_pca > 0 else R
         self.seed_proj = nn.Linear(R, d_seed)
-        self.net = ResMLP(n_pca + 32, d_seed + d_cond_rest, n_pca, width)
+        self.net = ResMLP(self.d_out + 32, d_seed + d_cond_rest, self.d_out, width)
 
     def _cond(self, c):
         return torch.cat([self.seed_proj(c[:, : self.R]), c[:, self.R:]], 1)
@@ -167,7 +170,13 @@ class SharedOffsetGenerator(nn.Module):
         self.n_tasks += 1
 
     def add_basis(self, d):
-        """Whitened PCA basis of a new task's offsets d (N, R)."""
+        """Whitened PCA basis of a new task's offsets d (N, R); with n_pca=0 the first task's standardization."""
+        if self.n_pca == 0:
+            if self.n_tasks == 0:
+                self.register_buffer("std_mu", d.mean(0))
+                self.register_buffer("std_scale", d.std(0).clamp(min=1e-6))
+            self.n_tasks += 1
+            return
         mu = d.mean(0)
         _, S, Vh = torch.linalg.svd(d - mu, full_matrices=False)
         k = min(self.n_pca, Vh.shape[0])
@@ -178,19 +187,29 @@ class SharedOffsetGenerator(nn.Module):
 
     def ensure_bases(self, n, device):
         """Placeholder bases so that a saved state with n tasks can be loaded."""
+        if self.n_pca == 0:
+            if self.n_tasks == 0:
+                self.register_buffer("std_mu", torch.zeros(self.R, device=device))
+                self.register_buffer("std_scale", torch.ones(self.R, device=device))
+            self.n_tasks = max(self.n_tasks, n)
+            return
         while self.n_tasks < n:
             self._register_basis(torch.zeros(self.R, device=device), torch.zeros(self.n_pca, self.R, device=device),
                                  torch.ones(self.n_pca, device=device))
 
     def coords(self, d, j):
+        if self.n_pca == 0:
+            return (d - self.std_mu) / self.std_scale
         return ((d - getattr(self, f"mu{j}")) @ getattr(self, f"V{j}").T) / getattr(self, f"scale{j}")
 
     def decode(self, y, j):
+        if self.n_pca == 0:
+            return y * self.std_scale + self.std_mu
         return (y * getattr(self, f"scale{j}")) @ getattr(self, f"V{j}") + getattr(self, f"mu{j}")
 
     @torch.no_grad()
     def sample_coords(self, C, n_steps=20, generator=None):
-        return flow_sample(self, C, self.n_pca, n_steps, generator)
+        return flow_sample(self, C, self.d_out, n_steps, generator)
 
     @torch.no_grad()
     def sample(self, C, j, n_steps=20, generator=None):
