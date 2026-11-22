@@ -468,7 +468,11 @@ class SeedDriftER(ER):
             r = (torch.rand(len(sidx), generator=self.lat_gen, device=sidx.device) * cnt.clamp(min=1)).long()
             mem = self.member_order[(self.seed_start[sidx] + r)[valid]]
             seed_img = cond[n_cur:, : self._image_dim()][valid]
-            low, lat_act = self.lat_low[mem], self.lat_actions[mem]
+            # the member's task embedding part is its seed's from this step (same task): with
+            # policy.project_language the projection keeps training and the stored one goes stale
+            P = self._prop_dim()
+            low = torch.cat([self.lat_low[mem][:, :P], cond[n_cur:, self._image_dim() + P:][valid]], 1)
+            lat_act = self.lat_actions[mem]
             if mode == "gen_grad":
                 off, a_gen, p_gen = self._generate(mem)
                 if a_gen is not None:  # joint: generated action chunk and proprio

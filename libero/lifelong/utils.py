@@ -125,6 +125,8 @@ def create_experiment_dir(cfg, reuse_latest=False):
         prefix += f"_gpt2"
     if cfg.task_embedding_format == "roberta":
         prefix += f"_roberta"
+    if cfg.task_embedding_format == "precomputed":
+        prefix += f"_precomputed"
 
     # NEW: add an output dir parameter to save whereever you want
     output_dir = cfg.output_dir if cfg.output_dir is not None else f"./{prefix}"
@@ -224,6 +226,14 @@ def get_task_embs(cfg, descriptions):
             return_tensors="pt",  # ask the function to return PyTorch tensors
         )
         task_embs = model(**tokens)["pooler_output"].detach()
+    elif cfg.task_embedding_format == "precomputed":
+        # {instruction: embedding} from scripts/precompute_task_embeddings.py (e.g. sentence-T5 as in Memory
+        # Anchors); task_embedding_file relative to libero/lifelong unless absolute
+        path = cfg.task_embedding_file
+        if not os.path.isabs(path):
+            path = os.path.join(os.path.dirname(os.path.abspath(__file__)), path)
+        embs = torch.load(path)
+        task_embs = torch.stack([embs[d] for d in descriptions]).float()
     if cfg.get("center_task_embs", False):
         # subtract the mean embedding of the suite's instructions: removes the direction all of
         # them share, so similar instructions are further apart
