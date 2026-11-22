@@ -66,7 +66,14 @@ def eval_lock():
         yield
         return
     with open(path, "a") as f:
-        fcntl.flock(f, fcntl.LOCK_EX)
+        t0 = time.time()
+        try:
+            fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            # tells a waiting run from a hung one (experiments/queue.sh, watch_runs.sh)
+            print("[info] waiting for another run's final evaluation (eval lock)", flush=True)
+            fcntl.flock(f, fcntl.LOCK_EX)
+            print(f"[info] waited {(time.time() - t0) / 60:.1f} min for another run's final evaluation", flush=True)
         try:
             yield
         finally:

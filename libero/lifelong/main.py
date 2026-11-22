@@ -1,5 +1,4 @@
 import faulthandler
-import fcntl
 import os
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -8,7 +7,6 @@ import json
 import multiprocessing
 import pprint
 import time
-from contextlib import contextmanager
 from pathlib import Path
 
 import hydra
@@ -44,30 +42,6 @@ from libero.lifelong.utils import (
     create_experiment_dir,
     get_task_embs,
 )
-
-
-@contextmanager
-def final_eval_lock():
-    """
-    LIBERO_EVAL_LOCK=<file>: runs sharing a GPU do their final evaluation one at a time (one evaluation with
-    eval.num_procs simulator workers needs ~12.5 GB). Only the timing changes, not the results.
-    """
-    path = os.environ.get("LIBERO_EVAL_LOCK")
-    if not path:
-        yield
-        return
-    with open(path, "a") as f:
-        t0 = time.time()
-        try:
-            fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            print("[info] waiting for another run's final evaluation (eval lock)", flush=True)
-            fcntl.flock(f, fcntl.LOCK_EX)
-            print(f"[info] waited {(time.time() - t0) / 60:.1f} min for another run's final evaluation", flush=True)
-        try:
-            yield
-        finally:
-            fcntl.flock(f, fcntl.LOCK_UN)
 
 
 # algorithms whose state after a task is fully given by the policy checkpoint and end_task
@@ -451,16 +425,15 @@ def main(hydra_cfg):
             # LIBERO_HANG_DUMP_MIN=<min>: stack traces of all threads every <min> minutes (diagnosing hung evaluations)
             if os.environ.get("LIBERO_HANG_DUMP_MIN"):
                 faulthandler.dump_traceback_later(60 * float(os.environ["LIBERO_HANG_DUMP_MIN"]), repeat=True)
-            with final_eval_lock():
-                t0 = time.time()
-                L = evaluate_loss(cfg, algo, benchmark, datasets[: i + 1])
-                S = evaluate_success(
-                    cfg=cfg,
-                    algo=algo,
-                    benchmark=benchmark,
-                    task_ids=list(range(i + 1)),
-                    result_summary=result_summary if cfg.eval.save_sim_states else None,
-                )
+            t0 = time.time()
+            L = evaluate_loss(cfg, algo, benchmark, datasets[: i + 1])
+            S = evaluate_success(
+                cfg=cfg,
+                algo=algo,
+                benchmark=benchmark,
+                task_ids=list(range(i + 1)),
+                result_summary=result_summary if cfg.eval.save_sim_states else None,
+            )
             result_summary["L_conf_mat"][i][: i + 1] = L
             result_summary["S_conf_mat"][i][: i + 1] = S
             result_summary["final_success"] = float(np.mean(S))
