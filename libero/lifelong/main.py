@@ -1,3 +1,4 @@
+import faulthandler
 import fcntl
 import os
 
@@ -447,6 +448,9 @@ def main(hydra_cfg):
             # all tasks trained (also when resuming a run whose final evaluation was interrupted:
             # the last checkpoint is loaded above)
             i = n_tasks_run - 1
+            # LIBERO_HANG_DUMP_MIN=<min>: stack traces of all threads every <min> minutes (diagnosing hung evaluations)
+            if os.environ.get("LIBERO_HANG_DUMP_MIN"):
+                faulthandler.dump_traceback_later(60 * float(os.environ["LIBERO_HANG_DUMP_MIN"]), repeat=True)
             with final_eval_lock():
                 t0 = time.time()
                 L = evaluate_loss(cfg, algo, benchmark, datasets[: i + 1])
