@@ -314,6 +314,7 @@ class SeedDriftER(ER):
         self.lat_dt = torch.cat([e["dt"][self._nonseed(e)] for e in self.store])
         self.lat_sample = torch.cat(sample_of)  # index of every replayed latent in its task's dataset
         self.seed_task, self.seed_stale = torch.cat(self.seed_task), torch.cat(self.seed_stale)
+        self.seed_var = self.seed_stale.var(0).mean().clamp(min=1e-8)  # scale of the seed distillation loss
         self.lat_gen = torch.Generator(device=dev).manual_seed(self.cfg.seed + task)
         # non-seed members of every seed's cluster (seed_offset_grad draws one per replayed seed)
         self.member_order = torch.argsort(self.lat_seed)
@@ -426,6 +427,19 @@ class SeedDriftER(ER):
             return e / e.norm(dim=1, keepdim=True) * d.norm(dim=1, keepdim=True)
         raise ValueError(f"[error] unknown lifelong.drift_compensation {mode}")
 
+    def _seed_distill_loss(self, nobs, n_cur, sidx):
+        """
+        lifelong.seed_distill_weight: the raw seeds of this step through the encoder again without augmentation (eval
+        transforms, as their stored latents; with gradient), pulled toward their latents F_j(s) stored at the end of
+        their task, relative to the stored seeds' mean per-dimension variance. Less encoder drift where the old tasks
+        live keeps their stored offsets valid (experiments/2026-11-23_spatial_drift).
+        """
+        enc = self.policy.dp.obs_encoder
+        enc.eval()
+        feat = enc({k: v[n_cur:] for k, v in nobs.items()})[:, : self._image_dim()]
+        enc.train()
+        return ((feat - self.seed_stale[sidx]) ** 2).mean() / self.seed_var
+
     @torch.no_grad()
     def _save_generated_samples(self, task, n):
         """
@@ -494,7 +508,8 @@ class SeedDriftER(ER):
         if per_step:
             policy = self.policy
             batch = policy._dp_batch(data)
-            cond = policy.dp.obs_encoder(policy.dp.normalizer.normalize(batch["obs"]))  # current + seeds
+            nobs = policy.dp.normalizer.normalize(batch["obs"])
+            cond = policy.dp.obs_encoder(nobs)  # current + seeds
             cnt = self.seed_count[sidx]
             valid = cnt > 0  # seeds whose cluster has non-seed members
             r = (torch.rand(len(sidx), generator=self.lat_gen, device=sidx.device) * cnt.clamp(min=1)).long()
@@ -519,6 +534,12 @@ class SeedDriftER(ER):
             global_cond = torch.cat([cond, lat], dim=0)
             actions = torch.cat([batch["action"], lat_act], dim=0)
             loss = policy.dp.compute_loss_from_global_cond(global_cond, policy.dp.normalizer["action"].normalize(actions))
+            w = self.cfg.lifelong.get("seed_distill_weight", 0.0)
+            if w > 0:
+                distill = self._seed_distill_loss(nobs, n_cur, sidx)
+                if self.n_steps == 1:
+                    print(f"[info] SeedDriftER: seed distillation loss at the first step of the task {distill.item():.4f}")
+                loss = loss + w * distill
         else:
             idx = self._next_latent_indices()
             cond = torch.cat([self.lat_img[idx], self.lat_low[idx]], dim=1)
