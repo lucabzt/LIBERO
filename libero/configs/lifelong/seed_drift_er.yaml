@@ -37,6 +37,12 @@ gen_save_samples: 0
 # *_grad modes: weight of a loss pulling the replayed raw seeds' current latents (no augmentation) toward their latents
 # stored at the end of their task, relative to the stored seeds' variance (less drift, offsets stay valid); 0: off
 seed_distill_weight: 0.0
+# auxiliary latent prediction on every task (algos/seed_drift_er.py LatentHead, not used for replay): weight of the
+# loss predicting F(x) - F(s) for a partner x of each current-task sample s, 1..latent_pred_max_dt steps later in its
+# demo, relative to the variance of F(x); 0: off
+latent_pred_weight: 0.0
+latent_pred_max_dt: 16
+latent_pred_width: 512
 # re-encode the seeds and rebuild the replayed latents every refit_every training steps
 refit_every: 200
 # ridge strength toward the identity, relative to the mean eigenvalue of X^T X of the seeds
