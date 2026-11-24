@@ -258,6 +258,7 @@ class SeedDriftER(ER):
     and x, the full action path between them and the signed steps (latent_pred_signed: partners before and after s).
     Extra flow targets on old tasks: latent_pred_seed_pairs (neighbouring raw seeds of a demo, both encoded now) and
     latent_pred_self_replay (offsets sampled from the head at the start of the task). Temporal seeds only.
+      raw_grad         plain ER on the raw seeds only (no latent replay): an ER baseline on exactly the same buffer
       pred_grad        as seed_offset_grad with the offset sampled from the flow head in the current encoder's space,
                        F_t(s) + G(F_t(s), proprio, actions s -> x, dt): nothing stored per sample but proprio and the
                        action sequence
@@ -583,7 +584,7 @@ class SeedDriftER(ER):
 
     def _step_offsets(self, mode, mem):
         """Offsets (F_j image space) added to the fresh seed latents for the cluster members mem."""
-        if mode == "seed_offset_grad":
+        if mode in ("seed_offset_grad", "raw_grad"):  # raw_grad: mem is empty
             return self.lat_off[mem]
         if mode == "seed_only_grad":
             return torch.zeros_like(self.lat_off[mem])
@@ -878,6 +879,8 @@ class SeedDriftER(ER):
             cond = policy.dp.obs_encoder(nobs)  # current + seeds
             cnt = self.seed_count[sidx]
             valid = cnt > 0  # seeds whose cluster has non-seed members
+            if mode == "raw_grad":  # plain ER on the raw seeds, no latent replay
+                valid = torch.zeros_like(valid)
             r = (torch.rand(len(sidx), generator=self.lat_gen, device=sidx.device) * cnt.clamp(min=1)).long()
             mem = self.member_order[(self.seed_start[sidx] + r)[valid]]
             seed_img = cond[n_cur:, : self._image_dim()][valid]
