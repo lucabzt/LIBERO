@@ -51,6 +51,19 @@ latent_pred_target_momentum: 0.99
 latent_pred_std_floor: 0.0
 # control: drop the prediction term, keep only the variance term (same partner loading and encoder passes)
 latent_pred_variance_only: false
+# regression (LatentHead, partner's offset from the seed's 16-step chunk) | flow (FlowOffsetHead: conditional flow of the
+# offset given F(s), proprio of s and x, the full action path between them and the signed steps)
+latent_pred_head: regression
+# partners also before the sample (backward in time)
+latent_pred_signed: false
+# flow head: action paths zero-padded / cut to this many steps
+latent_pred_path_len: 48
+# flow head, extra targets on old tasks: neighbouring raw seeds of a demo (encoded now) / offsets sampled from the head
+# at the start of the task; both need seed_selection=temporal
+latent_pred_seed_pairs: false
+latent_pred_self_replay: false
+# Euler steps when sampling offsets from the flow head (drift_compensation=pred_grad, self-replay)
+latent_pred_sample_steps: 10
 # re-encode the seeds and rebuild the replayed latents every refit_every training steps
 refit_every: 200
 # ridge strength toward the identity, relative to the mean eigenvalue of X^T X of the seeds

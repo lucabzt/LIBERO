@@ -10,7 +10,8 @@ from torch.utils.data import DataLoader, Subset
 
 from libero.lifelong.algos.base import Sequential
 from libero.lifelong.algos.er import ER, merge_datas
-from libero.lifelong.algos.offset_generator import OffsetGenerator, SharedOffsetGenerator, smooth_action_chunks
+from libero.lifelong.algos.offset_generator import (OffsetGenerator, ResMLP, SharedOffsetGenerator, flow_sample,
+                                                    smooth_action_chunks, time_emb)
 from libero.lifelong.algos.rand_er import EndlessRandomSampler
 
 
@@ -93,27 +94,69 @@ class Indexed(torch.utils.data.Dataset):
         return data
 
 
+def step_actions(dataset):
+    """Action of every sample's own time step (the first action of its chunk), (N, ac_dim), from the demos' arrays."""
+    sd = dataset.sequence_dataset
+    out = torch.cat([torch.as_tensor(sd.get_dataset_for_ep(d, "actions"), dtype=torch.float32) for d in sd.demos])
+    assert len(out) == len(dataset), (len(out), len(dataset))
+    return out
+
+
+def action_paths(steps, i, j, length):
+    """
+    Actions from the earlier of the frames i and j up to the later one (exclusive, chronological), zero-padded or cut
+    to length steps: (B, length, ac_dim) for index tensors i, j into steps (same demo).
+    """
+    lo, n = torch.minimum(i, j), (j - i).abs().clamp(max=length)
+    k = torch.arange(length, device=i.device)
+    idx = (lo[:, None] + k[None]).clamp(max=len(steps) - 1)
+    return steps[idx] * (k[None] < n[:, None])[..., None]
+
+
 class WithPartner(torch.utils.data.Dataset):
     """
-    Current-task samples with a partner sample of the same demo 1..max_dt steps later (lifelong.latent_pred_weight):
-    data["partner"] = {"obs": its observations, "dt": steps}; dt 0 (partner = the sample) at the last step of a demo.
+    Current-task samples with a partner sample of the same demo (lifelong.latent_pred_weight): 1..max_dt steps later,
+    or with signed=True up to max_dt steps before or after. data["partner"] = {"obs": its observations, "dt": signed
+    steps}, with path_len > 0 also "path", the actions between the two frames (action_paths). dt 0 (partner = the
+    sample) when no other step of the demo is in range.
     """
 
-    def __init__(self, dataset, max_dt):
-        self.dataset = dataset
-        self.max_dt = max_dt
+    def __init__(self, dataset, max_dt, signed=False, path_len=0):
+        self.dataset, self.max_dt, self.signed, self.path_len = dataset, max_dt, signed, path_len
         demo, ts = demo_and_time(dataset)
         demo_len = torch.bincount(demo)
         self.steps_left = demo_len[demo] - 1 - ts
+        self.steps_before = ts
+        self.steps = step_actions(dataset) if path_len > 0 else None
 
     def __len__(self):
         return len(self.dataset)
 
     def __getitem__(self, i):
         data = self.dataset[i]
-        left = int(self.steps_left[i])
-        dt = int(torch.randint(1, min(self.max_dt, left) + 1, (1,))) if left > 0 else 0
+        hi = min(self.max_dt, int(self.steps_left[i]))
+        lo = -min(self.max_dt, int(self.steps_before[i])) if self.signed else 1
+        choices = [d for d in range(lo, hi + 1) if d != 0]
+        dt = choices[int(torch.randint(len(choices), (1,)))] if choices else 0
         data["partner"] = {"obs": self.dataset[i + dt]["obs"], "dt": torch.tensor(dt, dtype=torch.long)}
+        if self.path_len > 0:
+            data["partner"]["path"] = action_paths(self.steps, torch.tensor([i]), torch.tensor([i + dt]), self.path_len)[0]
+        return data
+
+
+class WithNeighbor(torch.utils.data.Dataset):
+    """Seed replay samples (seed_index) with the observations of a neighbouring seed of their demo (neighbor_obs)."""
+
+    def __init__(self, seeds, neighbors):
+        self.seeds, self.neighbors = seeds, neighbors
+
+    def __len__(self):
+        return len(self.seeds)
+
+    def __getitem__(self, i):
+        data = self.seeds[i]
+        data["seed_index"] = torch.tensor(i, dtype=torch.long)
+        data["neighbor_obs"] = self.neighbors[i]["obs"]
         return data
 
 
@@ -136,6 +179,39 @@ class LatentHead(nn.Module):
         for b in self.blocks:
             h = h + b(h)
         return self.out(h)
+
+
+class FlowOffsetHead(nn.Module):
+    """
+    Conditional rectified flow of the image latent offset F(x) - F(s) (lifelong.latent_pred_head=flow): ResMLP velocity
+    field on [noisy offset, time embedding] given the condition; offsets divided by a running scale (std, momentum 0.99).
+    Output layer zero-initialized (velocity 0 at the start).
+    """
+
+    def __init__(self, R, d_cond, width):
+        super().__init__()
+        self.net = ResMLP(R + 32, d_cond, R, width)
+        nn.init.zeros_(self.net.out[1].weight)
+        nn.init.zeros_(self.net.out[1].bias)
+        self.register_buffer("scale", torch.tensor(0.0))
+
+    def loss(self, c, y):
+        with torch.no_grad():
+            s = y.detach().std()
+            self.scale.copy_(s if self.scale == 0 else 0.99 * self.scale + 0.01 * s)
+        y = y / self.scale.clone()  # several loss calls per step update the buffer in place
+        z = torch.randn_like(y)
+        t = torch.rand(len(y), device=y.device)
+        xt = (1 - t[:, None]) * z + t[:, None] * y
+        v = self.net(torch.cat([xt, time_emb(t)], 1), c)
+        return ((v - (y - z)) ** 2).mean()
+
+    @torch.no_grad()
+    def sample(self, c, n_steps, generator=None):
+        return flow_sample(self, c, self.net.out[1].out_features, n_steps, generator) * self.scale
+
+    def _cond(self, c):  # flow_sample calls model._cond
+        return c
 
 
 class SeedDriftER(ER):
@@ -178,6 +254,13 @@ class SeedDriftER(ER):
     encoded without augmentation; the loss reaches the encoder through F(s). Tests whether an encoder trained to make
     its latents predictable from the motion lets an offset predictor transfer to old tasks
     (experiments/2026-11-23_latent_predictor). The head is not used for replay.
+    lifelong.latent_pred_head=flow: the head is a conditional flow (FlowOffsetHead) of the offset given F(s), proprio of s
+    and x, the full action path between them and the signed steps (latent_pred_signed: partners before and after s).
+    Extra flow targets on old tasks: latent_pred_seed_pairs (neighbouring raw seeds of a demo, both encoded now) and
+    latent_pred_self_replay (offsets sampled from the head at the start of the task). Temporal seeds only.
+      pred_grad        as seed_offset_grad with the offset sampled from the flow head in the current encoder's space,
+                       F_t(s) + G(F_t(s), proprio, actions s -> x, dt): nothing stored per sample but proprio and the
+                       action sequence
     """
 
     def __init__(self, n_tasks, cfg, **policy_kwargs):
@@ -193,6 +276,7 @@ class SeedDriftER(ER):
         self.aux_var = None
         self.target_encoder = None
         self.latent_std = None
+        self.sr_cond = self.sr_y = None
 
     # ------------------------------------------------------------------ storage at the end of a task
     @torch.no_grad()
@@ -218,7 +302,8 @@ class SeedDriftER(ER):
 
     def learn_one_task(self, dataset, task_id, benchmark, result_summary):
         if self.cfg.lifelong.get("latent_pred_weight", 0.0) > 0:
-            dataset = WithPartner(dataset, self.cfg.lifelong.latent_pred_max_dt)
+            dataset = WithPartner(dataset, self.cfg.lifelong.latent_pred_max_dt,
+                                  self.cfg.lifelong.get("latent_pred_signed", False), self._path_len() if self._flow() else 0)
         return super().learn_one_task(dataset, task_id, benchmark, result_summary)
 
     def end_task(self, dataset, task_id, benchmark, env=None):
@@ -352,8 +437,16 @@ class SeedDriftER(ER):
         # raw seeds of all past tasks: replay loader (encoder gradient) and a cached copy for refits
         seed_sets = [Subset(ds, e["seeds"].cpu().tolist()) for ds, e in zip(self.datasets, self.store)]
         seed_all = torch.utils.data.ConcatDataset(seed_sets)
+        lc = self.cfg.lifelong
+        uses_paths = self._flow() and (lc.drift_compensation == "pred_grad" or lc.get("latent_pred_self_replay", False)
+                                        or lc.get("latent_pred_seed_pairs", False))
+        if uses_paths:
+            assert lc.get("seed_selection", "kmeans") == "temporal", "[error] action paths need temporal seeds (same demo)"
+        seed_ds = Indexed(seed_all)
+        if self._flow() and lc.get("latent_pred_seed_pairs", False):
+            seed_ds = WithNeighbor(seed_all, torch.utils.data.ConcatDataset(self._seed_neighbors()))
         self.seed_loader = iter(DataLoader(
-            Indexed(seed_all), batch_size=max(1, round(self.cfg.lifelong.replay_ratio * bs)),
+            seed_ds, batch_size=max(1, round(self.cfg.lifelong.replay_ratio * bs)),
             num_workers=self.cfg.train.num_workers, sampler=EndlessRandomSampler(len(seed_all), self.cfg.seed + task)))
         self.seed_batches = [self.map_tensor_to_device(d) for d in
                              DataLoader(seed_all, batch_size=128, shuffle=False, num_workers=self.cfg.train.num_workers)]
@@ -391,6 +484,11 @@ class SeedDriftER(ER):
         self.lat_perm, self.lat_pos = None, 0
         self.lat_bs = max(1, round(self.cfg.lifelong.latent_replay_ratio * bs))
         self.n_steps = 0
+        self.sr_cond = self.sr_y = None
+        if uses_paths:
+            self._setup_flow_paths()
+            if lc.get("latent_pred_self_replay", False):
+                self._setup_self_replay()
         self._refit()
 
         n_seed, n_lat = len(self.seed_stale), len(self.lat_off)
@@ -561,12 +659,108 @@ class SeedDriftER(ER):
         return off, act, prop
 
     # ------------------------------------------------------------------ auxiliary latent prediction
+    def _flow(self):
+        return self.cfg.lifelong.get("latent_pred_head", "regression") == "flow"
+
+    def _path_len(self):
+        return self.cfg.lifelong.get("latent_pred_path_len", 48)
+
     def _get_latent_head(self):
         if self.latent_head is None:
             R, P = self._image_dim(), self._prop_dim()
-            n_act = self.policy.horizon * self.cfg.shape_meta.ac_dim
-            self.latent_head = LatentHead(R + 2 * P + n_act + 1, R, self.cfg.lifelong.latent_pred_width).to(self.cfg.device)
+            width = self.cfg.lifelong.latent_pred_width
+            if self._flow():
+                d_cond = R + 2 * P + self._path_len() * self.cfg.shape_meta.ac_dim + 1
+                self.latent_head = FlowOffsetHead(R, d_cond, width).to(self.cfg.device)
+            else:
+                n_act = self.policy.horizon * self.cfg.shape_meta.ac_dim
+                self.latent_head = LatentHead(R + 2 * P + n_act + 1, R, width).to(self.cfg.device)
         return self.latent_head
+
+    def _flow_cond(self, z_s, prop_s, prop_x, path, dt):
+        """Flow head condition: seed latent, proprio of seed and sample, normalized action path, signed steps / path_len."""
+        L = self._path_len()
+        mask = (torch.arange(L, device=path.device)[None] < dt.abs().clamp(max=L)[:, None])[..., None]
+        path = self.policy.dp.normalizer["action"].normalize(path) * mask
+        return torch.cat([z_s, prop_s, prop_x, path.flatten(1), dt.float()[:, None] / L], 1)
+
+    def _seed_neighbors(self):
+        """
+        lifelong.latent_pred_seed_pairs: for every seed of every past task the next (else the previous) seed of its demo
+        at most latent_pred_path_len steps away, with the action path and signed steps to it. Returns per task a Subset
+        of the neighbours (the seed itself where there is none; masked by seed_nb_valid).
+        """
+        L, dev = self._path_len(), self.cfg.device
+        sets, valid, paths, dsteps = [], [], [], []
+        for ds, e in zip(self.datasets, self.store):
+            demo, _ = demo_and_time(ds)
+            s = e["seeds"].cpu()
+            d = demo[s]
+            nxt, prv = torch.cat([s[1:], s[-1:]]), torch.cat([s[:1], s[:-1]])
+            same_n = torch.cat([d[1:] == d[:-1], torch.tensor([False])]) & (nxt - s <= L)
+            same_p = torch.cat([torch.tensor([False]), d[1:] == d[:-1]]) & (s - prv <= L)
+            nb = torch.where(same_n, nxt, torch.where(same_p, prv, s))
+            paths.append(action_paths(e["actions"][:, 0].to(dev), s.to(dev), nb.to(dev), L))
+            dsteps.append((nb - s).to(dev))
+            valid.append((same_n | same_p).to(dev))
+            sets.append(Subset(ds, nb.tolist()))
+        self.seed_nb_valid, self.seed_nb_path, self.seed_nb_dsteps = torch.cat(valid), torch.cat(paths), torch.cat(dsteps)
+        print(f"[info] SeedDriftER flow head: {int(self.seed_nb_valid.sum())} of {len(self.seed_nb_valid)} seeds have a "
+              f"neighbouring seed within {L} steps (mean |dt| {self.seed_nb_dsteps[self.seed_nb_valid].abs().float().mean():.1f})")
+        return sets
+
+    def _setup_flow_paths(self):
+        """Action paths and signed steps from every replayed latent's seed to it (temporal seeds: same demo)."""
+        L, dev = self._path_len(), self.cfg.device
+        paths, dsteps = [], []
+        for e in self.store:
+            ns = torch.nonzero(self._nonseed(e)).squeeze(1)
+            s = e["seeds"][e["assign"][ns]]
+            paths.append(action_paths(e["actions"][:, 0].to(dev), s.to(dev), ns.to(dev), L))
+            dsteps.append((ns - s).to(dev))
+        self.lat_path, self.lat_dsteps = torch.cat(paths), torch.cat(dsteps)
+        print(f"[info] SeedDriftER flow head: action paths of {len(self.lat_dsteps)} replayed latents, mean |dt| "
+              f"{self.lat_dsteps.abs().float().mean():.1f} steps, {int((self.lat_dsteps.abs() > L).sum())} longer than {L} (cut)")
+
+    @torch.no_grad()
+    def _setup_self_replay(self):
+        """
+        lifelong.latent_pred_self_replay: offsets of all replayed latents sampled from the head as it is at the start of
+        the task, with the seed latents of the encoder at that time; extra flow targets during the task, so the head keeps
+        the old tasks' dynamics (each offset at most one task old).
+        """
+        R, P = self._image_dim(), self._prop_dim()
+        was_training = self.policy.training
+        self.policy.eval()
+        cur = torch.cat([self.policy.encode_latents(d)[0].float() for d in self.seed_batches])
+        self.policy.train(was_training)
+        c = self._flow_cond(cur[self.lat_seed, :R], cur[self.lat_seed, R:R + P], self.lat_low[:, :P], self.lat_path,
+                            self.lat_dsteps)
+        n_steps = self.cfg.lifelong.get("latent_pred_sample_steps", 10)
+        self.sr_y = torch.cat([self._get_latent_head().sample(c[i: i + 4096], n_steps, self.lat_gen)
+                               for i in range(0, len(c), 4096)])
+        self.sr_cond = c
+        print(f"[info] SeedDriftER flow head: {len(c)} self-replay targets sampled")
+
+    def _old_flow_loss(self, data, cond, n_cur, sidx, nb_obs):
+        """Flow loss on old tasks: neighbouring seed pairs encoded now (seed_pairs) and self-replay targets."""
+        R, P = self._image_dim(), self._prop_dim()
+        terms = []
+        if nb_obs is not None:
+            v = self.seed_nb_valid[sidx]
+            if v.any():
+                obs = self.policy._dp_batch({"obs": self.map_tensor_to_device(nb_obs), "task_emb": data["task_emb"][n_cur:],
+                                             "actions": data["actions"][n_cur:]})["obs"]
+                with torch.no_grad():
+                    zn = self._get_target_encoder()(self.policy.dp.normalizer.normalize(obs))[v]
+                zs = cond[n_cur:][v]
+                c = self._flow_cond(zs[:, :R], zs[:, R:R + P], zn[:, R:R + P], self.seed_nb_path[sidx[v]],
+                                    self.seed_nb_dsteps[sidx[v]])
+                terms.append(self.latent_head.loss(c, zn[:, :R] - zs[:, :R].detach()))
+        if self.sr_cond is not None:
+            i = torch.randint(len(self.sr_cond), (len(sidx),), device=self.sr_cond.device, generator=self.lat_gen)
+            terms.append(self.latent_head.loss(self.sr_cond[i], self.sr_y[i]))
+        return sum(terms) if terms else torch.zeros((), device=cond.device)
 
     def _save_or_load_latent_head(self, task_id):
         """Saved at the end of every task; a resumed run reloads the head of its last finished task."""
@@ -611,15 +805,21 @@ class SeedDriftER(ER):
         with torch.no_grad():
             zx = self._get_target_encoder()(policy.dp.normalizer.normalize(x_obs))
         self.latent_std = zs[:, :R].detach().std(0).mean()
-        dt = partner["dt"].float()
-        act = policy.dp.normalizer["action"].normalize(s_batch["action"])
-        act = act * (torch.arange(act.shape[1], device=act.device)[None, :, None] < dt[:, None, None])
-        inp = torch.cat([zs[:, :R], zs[:, R:R + P], zx[:, R:R + P], act.flatten(1),
-                         dt[:, None] / self.cfg.lifelong.latent_pred_max_dt], 1)
-        pred = zs[:, :R] + self.latent_head(inp)
-        var = zx[:, :R].var(0).mean()
-        self.aux_var = var if self.aux_var is None else 0.99 * self.aux_var + 0.01 * var
-        loss = ((pred - zx[:, :R]) ** 2).mean() / self.aux_var
+        if self._flow():
+            # the encoder learns through the condition only: with F(s) in the target too it collapsed (smoke_flowgen:
+            # latent std 0.002), since all-zero offsets make the flow trivial
+            c = self._flow_cond(zs[:, :R], zs[:, R:R + P], zx[:, R:R + P], partner["path"], partner["dt"])
+            loss = self.latent_head.loss(c, zx[:, :R] - zs[:, :R].detach())
+        else:
+            dt = partner["dt"].float()
+            act = policy.dp.normalizer["action"].normalize(s_batch["action"])
+            act = act * (torch.arange(act.shape[1], device=act.device)[None, :, None] < dt[:, None, None])
+            inp = torch.cat([zs[:, :R], zs[:, R:R + P], zx[:, R:R + P], act.flatten(1),
+                             dt[:, None] / self.cfg.lifelong.latent_pred_max_dt], 1)
+            pred = zs[:, :R] + self.latent_head(inp)
+            var = zx[:, :R].var(0).mean()
+            self.aux_var = var if self.aux_var is None else 0.99 * self.aux_var + 0.01 * var
+            loss = ((pred - zx[:, :R]) ** 2).mean() / self.aux_var
         if self.cfg.lifelong.get("latent_pred_variance_only", False):
             loss = 0.0 * loss  # control: only the variance term below, same compute
         floor = self.cfg.lifelong.get("latent_pred_std_floor", 0.0)
@@ -667,6 +867,7 @@ class SeedDriftER(ER):
         self.n_steps += 1
         buf = next(self.seed_loader)
         sidx = buf.pop("seed_index").to(self.cfg.device)
+        nb_obs = buf.pop("neighbor_obs", None)
         n_cur = data["actions"].shape[0]
         data = self.map_tensor_to_device(merge_datas(data, buf))
         self.optimizer.zero_grad()
@@ -693,6 +894,11 @@ class SeedDriftER(ER):
                     if keep > 0:
                         lat_act = smooth_action_chunks(lat_act, keep)
                     low = torch.cat([p_gen, low[:, self._prop_dim():]], 1)
+            elif mode == "pred_grad":
+                R = self._image_dim()
+                c = self._flow_cond(seed_img.detach(), cond[n_cur:, R:R + P][valid].detach(), self.lat_low[mem][:, :P],
+                                    self.lat_path[mem], self.lat_dsteps[mem])
+                off = self.latent_head.sample(c, self.cfg.lifelong.get("latent_pred_sample_steps", 10), self.lat_gen)
             else:
                 off = self._step_offsets(mode, mem)
             lat = torch.cat([seed_img + off, low], dim=1)
@@ -705,10 +911,14 @@ class SeedDriftER(ER):
                 if self.n_steps == 1:
                     print(f"[info] SeedDriftER: seed distillation loss at the first step of the task {distill.item():.4f}")
                 loss = loss + w * distill
+            total = loss
+            if self._flow() and (nb_obs is not None or self.sr_cond is not None):
+                total = loss + self.cfg.lifelong.latent_pred_weight * self._old_flow_loss(data, cond, n_cur, sidx, nb_obs)
         else:
             idx = self._next_latent_indices()
             cond = torch.cat([self.lat_img[idx], self.lat_low[idx]], dim=1)
             loss = self.policy.compute_loss_with_latent_replay(data, cond, self.lat_actions[idx])
+            total = loss
         if partner is None:
-            return self._optimizer_step(loss, loss)
-        return self._optimizer_step(self._add_latent_pred_loss(loss, cur, partner), loss)
+            return self._optimizer_step(total, loss)
+        return self._optimizer_step(self._add_latent_pred_loss(total, cur, partner), loss)
