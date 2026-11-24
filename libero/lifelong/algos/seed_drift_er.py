@@ -620,6 +620,8 @@ class SeedDriftER(ER):
         var = zx[:, :R].var(0).mean()
         self.aux_var = var if self.aux_var is None else 0.99 * self.aux_var + 0.01 * var
         loss = ((pred - zx[:, :R]) ** 2).mean() / self.aux_var
+        if self.cfg.lifelong.get("latent_pred_variance_only", False):
+            loss = 0.0 * loss  # control: only the variance term below, same compute
         floor = self.cfg.lifelong.get("latent_pred_std_floor", 0.0)
         if floor > 0:
             loss = loss + torch.relu(1 - zs[:, :R].std(0) / floor).mean()
