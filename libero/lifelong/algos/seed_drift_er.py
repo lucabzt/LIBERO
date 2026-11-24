@@ -1,3 +1,4 @@
+import copy
 import math
 import os
 import time
@@ -189,6 +190,9 @@ class SeedDriftER(ER):
         self.replay_cost = {}
         self.latent_head = None
         self.aux_sum, self.aux_n = 0.0, 0
+        self.aux_var = None
+        self.target_encoder = None
+        self.latent_std = None
 
     # ------------------------------------------------------------------ storage at the end of a task
     @torch.no_grad()
@@ -573,24 +577,53 @@ class SeedDriftER(ER):
             os.makedirs(os.path.dirname(path), exist_ok=True)
             torch.save(self._get_latent_head().state_dict(), path)
 
+    def _get_target_encoder(self):
+        if self.target_encoder is None:
+            self.target_encoder = copy.deepcopy(self.policy.dp.obs_encoder).eval()
+            for q in self.target_encoder.parameters():
+                q.requires_grad = False
+        return self.target_encoder
+
+    @torch.no_grad()
+    def _update_target_encoder(self):
+        m = self.cfg.lifelong.latent_pred_target_momentum
+        for t, o in zip(self.target_encoder.parameters(), self.policy.dp.obs_encoder.parameters()):
+            t.mul_(m).add_(o.detach(), alpha=1 - m)
+
     def _latent_pred_loss(self, cur, partner):
-        """Prediction error of F(x) from F(s) + head(...), relative to the batch's mean per-dimension variance of F(x)."""
+        """
+        Prediction error of F(x) from F(s) + head(...), relative to a running mean (momentum 0.99) of the batches' mean
+        per-dimension variance of F(x). The target F(x) comes from an EMA copy of the encoder (momentum
+        latent_pred_target_momentum, as BYOL): with the online encoder as target (705ebdc, runs
+        ss_offset_grad_spatial5_lp01 / _lp10) the image latents collapsed (std ~1e-4 instead of ~0.15), and dividing by
+        the batch's own variance gave loss spikes up to ~2500. The EMA target alone still shrank the latents (std 0.003
+        vs 0.021 without the loss after 500 steps): the loss rewards removing what the head cannot predict from the
+        motion. latent_pred_std_floor > 0 adds a VICReg variance term, mean_j relu(1 - std_j(F(s)) / floor) over the
+        image dims of the batch.
+        """
         policy, enc = self.policy, self.policy.dp.obs_encoder
         R, P = self._image_dim(), self._prop_dim()
         s_batch = policy._dp_batch(cur)
         x_obs = policy._dp_batch({"obs": partner["obs"], "task_emb": cur["task_emb"], "actions": cur["actions"]})["obs"]
         enc.eval()
         zs = enc(policy.dp.normalizer.normalize(s_batch["obs"]))
-        with torch.no_grad():
-            zx = enc(policy.dp.normalizer.normalize(x_obs))
         enc.train()
+        with torch.no_grad():
+            zx = self._get_target_encoder()(policy.dp.normalizer.normalize(x_obs))
+        self.latent_std = zs[:, :R].detach().std(0).mean()
         dt = partner["dt"].float()
         act = policy.dp.normalizer["action"].normalize(s_batch["action"])
         act = act * (torch.arange(act.shape[1], device=act.device)[None, :, None] < dt[:, None, None])
         inp = torch.cat([zs[:, :R], zs[:, R:R + P], zx[:, R:R + P], act.flatten(1),
                          dt[:, None] / self.cfg.lifelong.latent_pred_max_dt], 1)
         pred = zs[:, :R] + self.latent_head(inp)
-        return ((pred - zx[:, :R]) ** 2).mean() / zx[:, :R].var(0).mean()
+        var = zx[:, :R].var(0).mean()
+        self.aux_var = var if self.aux_var is None else 0.99 * self.aux_var + 0.01 * var
+        loss = ((pred - zx[:, :R]) ** 2).mean() / self.aux_var
+        floor = self.cfg.lifelong.get("latent_pred_std_floor", 0.0)
+        if floor > 0:
+            loss = loss + torch.relu(1 - zs[:, :R].std(0) / floor).mean()
+        return loss
 
     def _add_latent_pred_loss(self, loss, cur, partner):
         aux = self._latent_pred_loss(self.map_tensor_to_device(cur), self.map_tensor_to_device(partner))
@@ -599,7 +632,8 @@ class SeedDriftER(ER):
                   f"(policy loss {loss.item():.4f})")
         self.aux_sum, self.aux_n = self.aux_sum + aux.item(), self.aux_n + 1
         if self.aux_n == 500:
-            print(f"[info] SeedDriftER: latent prediction loss, mean of the last 500 steps {self.aux_sum / 500:.4f}")
+            print(f"[info] SeedDriftER: latent prediction loss, mean of the last 500 steps {self.aux_sum / 500:.4f}, "
+                  f"image latent std {self.latent_std.item():.4f} (collapse check; ~0.13-0.16 without the loss)")
             self.aux_sum, self.aux_n = 0.0, 0
         return loss + self.cfg.lifelong.latent_pred_weight * aux
 
@@ -609,6 +643,8 @@ class SeedDriftER(ER):
         if self.cfg.train.grad_clip is not None:
             nn.utils.clip_grad_norm_(self.policy.parameters(), self.cfg.train.grad_clip)
         self.optimizer.step()
+        if self.target_encoder is not None:
+            self._update_target_encoder()
         return logged_loss.item()
 
     def observe(self, data):
