@@ -60,9 +60,13 @@ def demo_and_time(dataset):
     return torch.tensor(demo), torch.tensor(ts)
 
 
-def temporal_seeds(demo, ts, n_seeds):
-    """n_seeds seeds spread over the demos in proportion to their length; each the middle frame of an equal
-    contiguous segment of its demo. Returns seed indices and the segment (seed) of every sample."""
+def temporal_seeds(demo, ts, n_seeds, stagger=False):
+    """
+    n_seeds seeds spread over the demos in proportion to their length; one per equal contiguous segment of its demo,
+    the middle frame, or with stagger=True at relative position (k + 0.5) / n_demos of the segment in demo k, so that
+    across the demos the seeds cover all phases of the task evenly (at 1% each demo gets one seed: middle frames never
+    show the start of a task, ss10_t1_er_rr2). Returns seed indices and the segment (seed) of every sample.
+    """
     n_demo = int(demo.max()) + 1
     lens = torch.bincount(demo, minlength=n_demo).float()
     per = torch.clamp(torch.round(lens / lens.sum() * n_seeds), min=1).long()
@@ -71,9 +75,10 @@ def temporal_seeds(demo, ts, n_seeds):
     for k in range(n_demo):
         L, m = int(lens[k]), int(per[k])
         seg = torch.clamp((torch.arange(L) * m) // L, max=m - 1)
+        phase = (k + 0.5) / n_demo if stagger else 0.5
         for q in range(m):
             idx = torch.nonzero(seg == q).squeeze(1)
-            seeds.append(start + int(idx[len(idx) // 2]))
+            seeds.append(start + int(idx[min(int(phase * len(idx)), len(idx) - 1)]))
             assign[start + idx] = len(seeds) - 1
         start += L
     return torch.tensor(seeds), assign
@@ -325,7 +330,7 @@ class SeedDriftER(ER):
             k = max(2, math.ceil(self.cfg.lifelong.seed_fraction * X.shape[0]))
             demo, ts = demo_and_time(dataset)
             if self.cfg.lifelong.get("seed_selection", "kmeans") == "temporal":
-                seeds, assign = temporal_seeds(demo, ts, k)
+                seeds, assign = temporal_seeds(demo, ts, k, self.cfg.lifelong.get("seed_stagger", False))
                 seeds, assign = seeds.to(X.device), assign.to(X.device)
             else:
                 g = torch.Generator().manual_seed(self.cfg.seed * 1000 + task_id)
