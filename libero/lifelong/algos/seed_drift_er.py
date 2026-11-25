@@ -84,6 +84,34 @@ def temporal_seeds(demo, ts, n_seeds, stagger=False):
     return torch.tensor(seeds), assign
 
 
+def trajectory_seeds(demo, ts, n_seeds, spacing):
+    """
+    n_seeds seeds every `spacing` frames along whole demos (frames 0, spacing, 2 * spacing, ...), demo after demo, the
+    demos taken evenly spread over the dataset until the budget is used: few demos, but each covered over its whole
+    length, and neighbouring seeds `spacing` frames apart give exact old-task pairs for an autoregressive generator.
+    Members: samples of covered demos less than `spacing` frames from a seed, assigned to the nearest one (at most
+    spacing / 2 away, the tail after the last seed up to spacing - 1); all other samples get assign -1 (not replayed).
+    """
+    n_demo = int(demo.max()) + 1
+    lens = torch.bincount(demo, minlength=n_demo)
+    starts = torch.cumsum(lens, 0) - lens
+    per_demo = (lens + spacing - 1) // spacing
+    n_cover = max(1, round(n_seeds / per_demo.float().mean().item()))
+    order = torch.linspace(0, n_demo - 1, min(n_cover, n_demo)).round().long().unique()
+    seeds, assign = [], torch.full_like(demo, -1)
+    for k in order.tolist():
+        if len(seeds) >= n_seeds:
+            break
+        frames = torch.arange(0, int(lens[k]), spacing)[: n_seeds - len(seeds)]
+        first = len(seeds)
+        seeds += (int(starts[k]) + frames).tolist()
+        t = torch.arange(int(lens[k]))
+        dist, nearest = (t[:, None] - frames[None]).abs().min(1)
+        near = dist < spacing  # a demo cut off by the budget keeps only the frames near its seeds
+        assign[int(starts[k]) + t[near]] = first + nearest[near]
+    return torch.tensor(seeds), assign
+
+
 class Indexed(torch.utils.data.Dataset):
     """A dataset whose samples also carry their index (seed_index)."""
 
@@ -332,6 +360,9 @@ class SeedDriftER(ER):
             if self.cfg.lifelong.get("seed_selection", "kmeans") == "temporal":
                 seeds, assign = temporal_seeds(demo, ts, k, self.cfg.lifelong.get("seed_stagger", False))
                 seeds, assign = seeds.to(X.device), assign.to(X.device)
+            elif self.cfg.lifelong.seed_selection == "trajectory":
+                seeds, assign = trajectory_seeds(demo, ts, k, self.cfg.lifelong.get("seed_spacing", 32))
+                seeds, assign = seeds.to(X.device), assign.to(X.device)
             else:
                 g = torch.Generator().manual_seed(self.cfg.seed * 1000 + task_id)
                 seeds = kmeans_medoids(X, k, g, n_init=self.cfg.lifelong.kmeans_n_init).to(X.device)
@@ -402,8 +433,7 @@ class SeedDriftER(ER):
         R, P = self._image_dim(), self._prop_dim()
         lc = self.cfg.lifelong
         path = os.path.join(self.experiment_dir, "seed_drift", f"gen_task{task_id}.pt")
-        nonseed = torch.ones(e["cond"].shape[0], dtype=torch.bool, device=e["cond"].device)
-        nonseed[e["seeds"]] = False
+        nonseed = self._nonseed(e)
         img = e["cond"][:, :R]
         zs = img[e["seeds"]][e["assign"]]
         prop, act = e["cond"][:, R:R + P], e["actions"].reshape(len(e["actions"]), -1)
@@ -447,7 +477,8 @@ class SeedDriftER(ER):
         uses_paths = self._flow() and (lc.drift_compensation == "pred_grad" or lc.get("latent_pred_self_replay", False)
                                         or lc.get("latent_pred_seed_pairs", False))
         if uses_paths:
-            assert lc.get("seed_selection", "kmeans") == "temporal", "[error] action paths need temporal seeds (same demo)"
+            assert lc.get("seed_selection", "kmeans") in ("temporal", "trajectory"), \
+                "[error] action paths need temporal or trajectory seeds (same demo)"
         seed_ds = Indexed(seed_all)
         if self._flow() and lc.get("latent_pred_seed_pairs", False):
             seed_ds = WithNeighbor(seed_all, torch.utils.data.ConcatDataset(self._seed_neighbors()))
@@ -463,8 +494,7 @@ class SeedDriftER(ER):
         seed_base = 0
         self.seed_task, self.seed_stale = [], []
         for j, e in enumerate(self.store):
-            nonseed = torch.ones(e["cond"].shape[0], dtype=torch.bool, device=dev)
-            nonseed[e["seeds"]] = False
+            nonseed = self._nonseed(e).to(dev)
             img = e["cond"][:, :R]
             s_img = img[e["seeds"]]
             off.append((img - s_img[e["assign"]])[nonseed])
@@ -524,7 +554,8 @@ class SeedDriftER(ER):
 
     @staticmethod
     def _nonseed(e):
-        m = torch.ones(e["cond"].shape[0], dtype=torch.bool, device=e["cond"].device)
+        """Replayed latents: samples that are not seeds and have a seed (trajectory seeds leave demos uncovered)."""
+        m = e["assign"] >= 0
         m[e["seeds"]] = False
         return m
 

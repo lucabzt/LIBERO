@@ -13,11 +13,15 @@ latent_replay_ratio: 1.0
 # seed_offset_grad (as seed_offset, F_t(s) from the raw seed replay of the same step, with encoder gradient;
 # one random cluster member per replayed seed as offset latent, latent_replay_ratio / refit_every unused)
 drift_compensation: seed_offset_map
-# kmeans (medoids of the image latents) | temporal (evenly spread over the demos, members = time segment)
+# kmeans (medoids of the image latents) | temporal (evenly spread over the demos, members = time segment) |
+# trajectory (every seed_spacing frames along whole demos, few demos)
 seed_selection: kmeans
 # temporal seeds: instead of each segment's middle frame, demo k's seed at relative position (k + 0.5) / n_demos of its
 # segment, so the seeds cover all phases of the task across the demos
 seed_stagger: false
+# seed_selection=trajectory: seeds every seed_spacing frames along whole demos (frame 0, spacing, ...), demo after demo
+# (evenly spread over the dataset) until the budget is used; samples of uncovered demos are not replayed as latents
+seed_spacing: 32
 # offset generator per task (drift_compensation=gen_grad): none | cond (offset given seed, proprio, action, dt)
 # | joint (offset, action, proprio given seed, dt; nothing stored per sample)
 generator: none
