@@ -171,7 +171,8 @@ class WithPartner(torch.utils.data.Dataset):
         lo = -min(self.max_dt, int(self.steps_before[i])) if self.signed else 1
         choices = [d for d in range(lo, hi + 1) if d != 0]
         dt = choices[int(torch.randint(len(choices), (1,)))] if choices else 0
-        data["partner"] = {"obs": self.dataset[i + dt]["obs"], "dt": torch.tensor(dt, dtype=torch.long)}
+        data["partner"] = {"obs": self.dataset[i + dt]["obs"], "dt": torch.tensor(dt, dtype=torch.long),
+                           "index": torch.tensor(i, dtype=torch.long)}
         if self.path_len > 0:
             data["partner"]["path"] = action_paths(self.steps, torch.tensor([i]), torch.tensor([i + dt]), self.path_len)[0]
         return data
@@ -190,6 +191,28 @@ class WithNeighbor(torch.utils.data.Dataset):
         data = self.seeds[i]
         data["seed_index"] = torch.tensor(i, dtype=torch.long)
         data["neighbor_obs"] = self.neighbors[i]["obs"]
+        return data
+
+
+class WithSeedPartner(torch.utils.data.Dataset):
+    """
+    Seed replay samples (seed_index) with the observations of a random other seed of their demo (neighbor_obs,
+    neighbor_index), drawn anew every time: all seed pairs of a demo, both directions (latent_pred_ar_len).
+    """
+
+    def __init__(self, seeds, partners):
+        self.seeds, self.partners = seeds, partners  # partners[i]: indices into seeds, same demo
+
+    def __len__(self):
+        return len(self.seeds)
+
+    def __getitem__(self, i):
+        data = self.seeds[i]
+        p = self.partners[i]
+        k = p[int(torch.randint(len(p), (1,)))] if len(p) else i
+        data["seed_index"] = torch.tensor(i, dtype=torch.long)
+        data["neighbor_index"] = torch.tensor(k, dtype=torch.long)
+        data["neighbor_obs"] = self.seeds[k]["obs"]
         return data
 
 
@@ -335,6 +358,11 @@ class SeedDriftER(ER):
         return self.R
 
     def learn_one_task(self, dataset, task_id, benchmark, result_summary):
+        if self._ar_len() > 0:
+            # proprio of every frame and the action of every step, for the intermediate frames of the chains
+            R, P = self._image_dim(), self._prop_dim()
+            self.cur_prop = self._encode(dataset)[0][:, R:R + P]
+            self.cur_steps = step_actions(dataset).to(self.cfg.device)
         if self.cfg.lifelong.get("latent_pred_weight", 0.0) > 0:
             dataset = WithPartner(dataset, self.cfg.lifelong.latent_pred_max_dt,
                                   self.cfg.lifelong.get("latent_pred_signed", False), self._path_len() if self._flow() else 0)
@@ -480,8 +508,13 @@ class SeedDriftER(ER):
             assert lc.get("seed_selection", "kmeans") in ("temporal", "trajectory"), \
                 "[error] action paths need temporal or trajectory seeds (same demo)"
         seed_ds = Indexed(seed_all)
+        if self._ar_len() > 0:
+            self._setup_ar_tables()
         if self._flow() and lc.get("latent_pred_seed_pairs", False):
-            seed_ds = WithNeighbor(seed_all, torch.utils.data.ConcatDataset(self._seed_neighbors()))
+            if self._ar_len() > 0:
+                seed_ds = WithSeedPartner(seed_all, self._seed_partners())
+            else:
+                seed_ds = WithNeighbor(seed_all, torch.utils.data.ConcatDataset(self._seed_neighbors()))
         self.seed_loader = iter(DataLoader(
             seed_ds, batch_size=max(1, round(self.cfg.lifelong.replay_ratio * bs)),
             num_workers=self.cfg.train.num_workers, sampler=EndlessRandomSampler(len(seed_all), self.cfg.seed + task)))
@@ -702,6 +735,60 @@ class SeedDriftER(ER):
     def _path_len(self):
         return self.cfg.lifelong.get("latent_pred_path_len", 48)
 
+    def _ar_len(self):
+        L = self.cfg.lifelong.get("latent_pred_ar_len", 0)
+        assert L == 0 or (self._flow() and L == self._path_len()), "[error] latent_pred_ar_len needs the flow head, path_len = ar_len"
+        return L
+
+    def _setup_ar_tables(self):
+        """Proprio and step actions of all frames of all past tasks in one index space, every seed's frame in it."""
+        R, P, dev = self._image_dim(), self._prop_dim(), self.cfg.device
+        sizes = torch.tensor([len(e["cond"]) for e in self.store], device=dev)
+        self.old_base = torch.cumsum(sizes, 0) - sizes
+        self.old_prop = torch.cat([e["cond"][:, R:R + P] for e in self.store])
+        self.old_steps = torch.cat([e["actions"][:, 0] for e in self.store]).to(dev)
+        self.seed_g = torch.cat([b + e["seeds"].to(dev) for b, e in zip(self.old_base, self.store)])
+
+    def _seed_partners(self):
+        """For every seed (index into all past seeds) the other seeds of its demo."""
+        out, base = [], 0
+        for ds, e in zip(self.datasets, self.store):
+            demo, _ = demo_and_time(ds)
+            d = demo[e["seeds"].cpu()]
+            for k in range(len(d)):
+                out.append([base + int(m) for m in torch.nonzero(d == d[k]).squeeze(1) if int(m) != k])
+            base += len(d)
+        n_pairs = sum(len(p) for p in out)
+        print(f"[info] SeedDriftER AR generator: {n_pairs} ordered seed pairs within demos "
+              f"({sum(1 for p in out if p)} of {len(out)} seeds have a partner)")
+        return out
+
+    @torch.no_grad()
+    def _ar_chain(self, z, a, b, prop, steps, to_last_step):
+        """
+        Steps of at most latent_pred_ar_len frames from frame a toward frame b (index tensors into prop / steps), each
+        from the head's own sample of the previous one, starting at latent z. to_last_step: stop one step short (the
+        caller trains that step, pushforward); else run to b. Returns the latent and the frame reached.
+        """
+        L, n_steps = self._ar_len(), self.cfg.lifelong.get("latent_pred_sample_steps", 10)
+        z, cur = z.clone(), a.clone()
+        while True:
+            rem = b - cur
+            i = torch.nonzero(rem.abs() > L if to_last_step else rem != 0).squeeze(1)
+            if len(i) == 0:
+                return z, cur
+            nxt = cur[i] + rem[i].clamp(-L, L)
+            c = self._flow_cond(z[i], prop[cur[i]], prop[nxt], action_paths(steps, cur[i], nxt, L), nxt - cur[i])
+            z[i] = z[i] + self.latent_head.sample(c, n_steps)
+            cur[i] = nxt
+
+    def _ar_last_step(self, z, a, b, prop, steps):
+        """Condition of the last step of the chain a -> b (single steps: from z itself, with its gradient)."""
+        z_in, cur = self._ar_chain(z.detach(), a, b, prop, steps, to_last_step=True)
+        z_in = torch.where((cur == a)[:, None], z, z_in)
+        L = self._ar_len()
+        return self._flow_cond(z_in, prop[cur], prop[b], action_paths(steps, cur, b, L), b - cur), z_in
+
     def _get_latent_head(self):
         if self.latent_head is None:
             R, P = self._image_dim(), self._prop_dim()
@@ -773,17 +860,30 @@ class SeedDriftER(ER):
         self.policy.train(was_training)
         c = self._flow_cond(cur[self.lat_seed, :R], cur[self.lat_seed, R:R + P], self.lat_low[:, :P], self.lat_path,
                             self.lat_dsteps)
+        if self._ar_len() > 0:  # single steps only: members at most ar_len frames from their seed
+            c = c[self.lat_dsteps.abs() <= self._ar_len()]
         n_steps = self.cfg.lifelong.get("latent_pred_sample_steps", 10)
         self.sr_y = torch.cat([self._get_latent_head().sample(c[i: i + 4096], n_steps, self.lat_gen)
                                for i in range(0, len(c), 4096)])
         self.sr_cond = c
         print(f"[info] SeedDriftER flow head: {len(c)} self-replay targets sampled")
 
-    def _old_flow_loss(self, data, cond, n_cur, sidx, nb_obs):
+    def _old_flow_loss(self, data, cond, n_cur, sidx, nb_obs, nb_index=None):
         """Flow loss on old tasks: neighbouring seed pairs encoded now (seed_pairs) and self-replay targets."""
         R, P = self._image_dim(), self._prop_dim()
         terms = []
-        if nb_obs is not None:
+        if nb_obs is not None and self._ar_len() > 0:
+            # a random other seed of the demo, chained (both encoded now: seed online, partner with the EMA target)
+            obs = self.policy._dp_batch({"obs": self.map_tensor_to_device(nb_obs), "task_emb": data["task_emb"][n_cur:],
+                                         "actions": data["actions"][n_cur:]})["obs"]
+            with torch.no_grad():
+                zn = self._get_target_encoder()(self.policy.dp.normalizer.normalize(obs))
+            a, b = self.seed_g[sidx], self.seed_g[nb_index]
+            v = a != b
+            if v.any():
+                c, z_in = self._ar_last_step(cond[n_cur:, :R][v], a[v], b[v], self.old_prop, self.old_steps)
+                terms.append(self.latent_head.loss(c, zn[v, :R] - z_in.detach()))
+        elif nb_obs is not None:
             v = self.seed_nb_valid[sidx]
             if v.any():
                 obs = self.policy._dp_batch({"obs": self.map_tensor_to_device(nb_obs), "task_emb": data["task_emb"][n_cur:],
@@ -849,8 +949,15 @@ class SeedDriftER(ER):
         if self._flow():
             # the encoder learns through the condition only: with F(s) in the target too it collapsed (smoke_flowgen:
             # latent std 0.002), since all-zero offsets make the flow trivial
-            c = self._flow_cond(zs[:, :R], zs[:, R:R + P], zx[:, R:R + P], partner["path"], partner["dt"])
-            loss = self.latent_head.loss(c, zx[:, :R] - zs[:, :R].detach())
+            if self._ar_len() > 0:
+                # chains of steps <= ar_len frames toward partners up to latent_pred_max_dt away (pushforward: only the
+                # last step is trained, from the head's own rollout; single steps keep the encoder gradient)
+                a = partner["index"]
+                c, z_in = self._ar_last_step(zs[:, :R], a, a + partner["dt"], self.cur_prop, self.cur_steps)
+                loss = self.latent_head.loss(c, zx[:, :R] - z_in.detach())
+            else:
+                c = self._flow_cond(zs[:, :R], zs[:, R:R + P], zx[:, R:R + P], partner["path"], partner["dt"])
+                loss = self.latent_head.loss(c, zx[:, :R] - zs[:, :R].detach())
         else:
             dt = partner["dt"].float()
             act = policy.dp.normalizer["action"].normalize(s_batch["action"])
@@ -930,6 +1037,8 @@ class SeedDriftER(ER):
         buf = next(self.seed_loader)
         sidx = buf.pop("seed_index").to(self.cfg.device)
         nb_obs = buf.pop("neighbor_obs", None)
+        nb_index = buf.pop("neighbor_index", None)
+        nb_index = None if nb_index is None else nb_index.to(self.cfg.device)
         n_cur = data["actions"].shape[0]
         data = self.map_tensor_to_device(merge_datas(data, buf))
         self.optimizer.zero_grad()
@@ -960,9 +1069,16 @@ class SeedDriftER(ER):
                     low = torch.cat([p_gen, low[:, self._prop_dim():]], 1)
             elif mode == "pred_grad":
                 R = self._image_dim()
-                c = self._flow_cond(seed_img.detach(), cond[n_cur:, R:R + P][valid].detach(), self.lat_low[mem][:, :P],
-                                    self.lat_path[mem], self.lat_dsteps[mem])
-                off = self.latent_head.sample(c, self.cfg.lifelong.get("latent_pred_sample_steps", 10), self.lat_gen)
+                if self._ar_len() > 0:  # chained steps from the seed to the member
+                    z0 = seed_img.detach()
+                    x_g = self.old_base[self.lat_task[mem]] + self.lat_sample[mem]
+                    z, _ = self._ar_chain(z0, self.seed_g[self.lat_seed[mem]], x_g, self.old_prop, self.old_steps,
+                                          to_last_step=False)
+                    off = z - z0
+                else:
+                    c = self._flow_cond(seed_img.detach(), cond[n_cur:, R:R + P][valid].detach(),
+                                        self.lat_low[mem][:, :P], self.lat_path[mem], self.lat_dsteps[mem])
+                    off = self.latent_head.sample(c, self.cfg.lifelong.get("latent_pred_sample_steps", 10), self.lat_gen)
                 if os.environ.get("SDR_NAN_DEBUG"):
                     self.dbg_off_max = off.abs().max().item()
                     self.dbg_seed_max = seed_img.detach().abs().max().item()
@@ -985,7 +1101,7 @@ class SeedDriftER(ER):
                 loss = loss + w * distill
             total = loss
             if self._flow() and (nb_obs is not None or self.sr_cond is not None):
-                old_loss = self._old_flow_loss(data, cond, n_cur, sidx, nb_obs)
+                old_loss = self._old_flow_loss(data, cond, n_cur, sidx, nb_obs, nb_index)
                 if os.environ.get("SDR_NAN_DEBUG"):
                     self.dbg_parts["old_flow_loss"] = old_loss.item()
                 total = loss + self.cfg.lifelong.latent_pred_weight * old_loss

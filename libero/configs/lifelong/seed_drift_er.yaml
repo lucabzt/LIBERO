@@ -69,6 +69,11 @@ latent_pred_path_len: 48
 # at the start of the task; both need seed_selection=temporal
 latent_pred_seed_pairs: false
 latent_pred_self_replay: false
+# flow head as an autoregressive generator (0: off, one step from seed to sample): steps of at most this many frames
+# (= latent_pred_path_len), chained with the stored proprio and actions of the frames between. Current-task partners up
+# to latent_pred_max_dt away and all seed pairs of a demo (latent_pred_seed_pairs) as chains, trained on the last step
+# from the head's own rollout (pushforward); replay chains from the seed to the sample; self-replay single steps only
+latent_pred_ar_len: 0
 # Euler steps when sampling offsets from the flow head (drift_compensation=pred_grad, self-replay)
 latent_pred_sample_steps: 10
 # re-encode the seeds and rebuild the replayed latents every refit_every training steps
