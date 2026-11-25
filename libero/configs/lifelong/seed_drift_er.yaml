@@ -13,6 +13,9 @@ latent_replay_ratio: 1.0
 # seed_offset_grad (as seed_offset, F_t(s) from the raw seed replay of the same step, with encoder gradient;
 # one random cluster member per replayed seed as offset latent, latent_replay_ratio / refit_every unused)
 drift_compensation: seed_offset_map
+# results run directory of another SeedDriftER run (.../run_001): use its seed frames (seed_drift/task<j>.pt) instead of
+# selecting own ones (same-buffer comparisons with k-means seeds); null: off
+seed_from_run: null
 # kmeans (medoids of the image latents) | temporal (evenly spread over the demos, members = time segment) |
 # trajectory (every seed_spacing frames along whole demos, few demos)
 seed_selection: kmeans

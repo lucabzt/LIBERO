@@ -385,7 +385,13 @@ class SeedDriftER(ER):
             X = cond[:, :R]
             k = max(2, math.ceil(self.cfg.lifelong.seed_fraction * X.shape[0]))
             demo, ts = demo_and_time(dataset)
-            if self.cfg.lifelong.get("seed_selection", "kmeans") == "temporal":
+            seed_run = self.cfg.lifelong.get("seed_from_run", None)
+            if seed_run:
+                # the seed frames of another run (same benchmark, order, demos): same-buffer comparisons with
+                # k-means seeds, which depend on the run's own encoder; members assigned to the nearest seed here
+                seeds = torch.load(os.path.join(seed_run, "seed_drift", f"task{task_id}.pt"), map_location=X.device)["seeds"]
+                assign = torch.cdist(X, X[seeds]).argmin(1)
+            elif self.cfg.lifelong.get("seed_selection", "kmeans") == "temporal":
                 seeds, assign = temporal_seeds(demo, ts, k, self.cfg.lifelong.get("seed_stagger", False))
                 seeds, assign = seeds.to(X.device), assign.to(X.device)
             elif self.cfg.lifelong.seed_selection == "trajectory":
