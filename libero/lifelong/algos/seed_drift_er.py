@@ -797,6 +797,10 @@ class SeedDriftER(ER):
         image dims of the batch.
         """
         policy, enc = self.policy, self.policy.dp.obs_encoder
+        if cur["actions"].shape[0] < 2:
+            # the batch std of a single sample is NaN (n - 1 = 0): the last batch of an epoch can have one sample
+            # (ss10_t1_gen_sr went NaN in task 5 this way)
+            return torch.zeros((), device=cur["actions"].device)
         R, P = self._image_dim(), self._prop_dim()
         s_batch = policy._dp_batch(cur)
         x_obs = policy._dp_batch({"obs": partner["obs"], "task_emb": cur["task_emb"], "actions": cur["actions"]})["obs"]
@@ -838,11 +842,32 @@ class SeedDriftER(ER):
             print(f"[info] SeedDriftER: latent prediction loss, mean of the last 500 steps {self.aux_sum / 500:.4f}, "
                   f"image latent std {self.latent_std.item():.4f} (collapse check; ~0.13-0.16 without the loss)")
             self.aux_sum, self.aux_n = 0.0, 0
+        if os.environ.get("SDR_NAN_DEBUG"):
+            getattr(self, "dbg_parts", {}).update({"latent_pred_loss": aux.item()})
         return loss + self.cfg.lifelong.latent_pred_weight * aux
+
+    def _nan_debug(self, loss):
+        """SDR_NAN_DEBUG=1: every 50 steps (and at the first non-finite value, then stop) the loss, the gradient norms
+        of policy and latent head (before clipping), the largest generated offset and seed latent of the step."""
+        def gnorm(params):
+            g = [p.grad.norm() for p in params if p.grad is not None]
+            return torch.stack(g).norm().item() if g else 0.0
+        pol = gnorm(self.policy.parameters())
+        head = gnorm(self.latent_head.parameters()) if self.latent_head is not None else 0.0
+        info = (f"[nan-debug] step {self.n_steps} loss {loss.item():.4f} grad norm policy {pol:.1f} head {head:.1f} "
+                f"max|offset| {getattr(self, 'dbg_off_max', float('nan')):.2f} max|seed latent| "
+                f"{getattr(self, 'dbg_seed_max', float('nan')):.2f}")
+        finite = math.isfinite(loss.item()) and math.isfinite(pol) and math.isfinite(head)
+        if not finite or self.n_steps % 50 == 0:
+            print(info, getattr(self, "dbg_parts", {}), flush=True)
+        if not finite:
+            raise RuntimeError("[nan-debug] first non-finite loss or gradient")
 
     def _optimizer_step(self, loss, logged_loss):
         """Logged (train loss in the epoch lines): the policy loss without the auxiliary latent prediction."""
         (self.loss_scale * loss).backward()
+        if os.environ.get("SDR_NAN_DEBUG"):
+            self._nan_debug(loss)
         if self.cfg.train.grad_clip is not None:
             nn.utils.clip_grad_norm_(self.policy.parameters(), self.cfg.train.grad_clip)
         self.optimizer.step()
@@ -902,12 +927,20 @@ class SeedDriftER(ER):
                 c = self._flow_cond(seed_img.detach(), cond[n_cur:, R:R + P][valid].detach(), self.lat_low[mem][:, :P],
                                     self.lat_path[mem], self.lat_dsteps[mem])
                 off = self.latent_head.sample(c, self.cfg.lifelong.get("latent_pred_sample_steps", 10), self.lat_gen)
+                if os.environ.get("SDR_NAN_DEBUG"):
+                    self.dbg_off_max = off.abs().max().item()
+                    self.dbg_seed_max = seed_img.detach().abs().max().item()
             else:
                 off = self._step_offsets(mode, mem)
             lat = torch.cat([seed_img + off, low], dim=1)
             global_cond = torch.cat([cond, lat], dim=0)
             actions = torch.cat([batch["action"], lat_act], dim=0)
             loss = policy.dp.compute_loss_from_global_cond(global_cond, policy.dp.normalizer["action"].normalize(actions))
+            if os.environ.get("SDR_NAN_DEBUG"):
+                self.dbg_parts = {"policy_loss": loss.item(), "cond_finite": bool(torch.isfinite(cond).all()),
+                                  "cond_max": cond.detach().abs().max().item(),
+                                  "replayed_finite": bool(torch.isfinite(lat).all()),
+                                  "actions_norm_max": policy.dp.normalizer["action"].normalize(actions).abs().max().item()}
             w = self.cfg.lifelong.get("seed_distill_weight", 0.0)
             if w > 0:
                 distill = self._seed_distill_loss(nobs, n_cur, sidx)
@@ -916,7 +949,10 @@ class SeedDriftER(ER):
                 loss = loss + w * distill
             total = loss
             if self._flow() and (nb_obs is not None or self.sr_cond is not None):
-                total = loss + self.cfg.lifelong.latent_pred_weight * self._old_flow_loss(data, cond, n_cur, sidx, nb_obs)
+                old_loss = self._old_flow_loss(data, cond, n_cur, sidx, nb_obs)
+                if os.environ.get("SDR_NAN_DEBUG"):
+                    self.dbg_parts["old_flow_loss"] = old_loss.item()
+                total = loss + self.cfg.lifelong.latent_pred_weight * old_loss
         else:
             idx = self._next_latent_indices()
             cond = torch.cat([self.lat_img[idx], self.lat_low[idx]], dim=1)
