@@ -151,11 +151,13 @@ class WithPartner(torch.utils.data.Dataset):
     Current-task samples with a partner sample of the same demo (lifelong.latent_pred_weight): 1..max_dt steps later,
     or with signed=True up to max_dt steps before or after. data["partner"] = {"obs": its observations, "dt": signed
     steps}, with path_len > 0 also "path", the actions between the two frames (action_paths). dt 0 (partner = the
-    sample) when no other step of the demo is in range.
+    sample) when no other step of the demo is in range. shape_dt > 0: a second partner 1..shape_dt steps later,
+    data["shape_partner"] = {"obs", "dt"} (lifelong.latent_shape_weight).
     """
 
-    def __init__(self, dataset, max_dt, signed=False, path_len=0):
+    def __init__(self, dataset, max_dt, signed=False, path_len=0, shape_dt=0):
         self.dataset, self.max_dt, self.signed, self.path_len = dataset, max_dt, signed, path_len
+        self.shape_dt = shape_dt
         demo, ts = demo_and_time(dataset)
         demo_len = torch.bincount(demo)
         self.steps_left = demo_len[demo] - 1 - ts
@@ -175,6 +177,10 @@ class WithPartner(torch.utils.data.Dataset):
                            "index": torch.tensor(i, dtype=torch.long)}
         if self.path_len > 0:
             data["partner"]["path"] = action_paths(self.steps, torch.tensor([i]), torch.tensor([i + dt]), self.path_len)[0]
+        if self.shape_dt > 0:
+            hi = min(self.shape_dt, int(self.steps_left[i]))
+            near = int(torch.randint(1, hi + 1, (1,))) if hi >= 1 else 0
+            data["shape_partner"] = {"obs": self.dataset[i + near]["obs"], "dt": torch.tensor(near, dtype=torch.long)}
         return data
 
 
@@ -329,8 +335,9 @@ class SeedDriftER(ER):
         self.n_steps = 0
         self.replay_cost = {}
         self.latent_head = None
-        self.aux_sum, self.aux_n = 0.0, 0
-        self.aux_var = None
+        self.shape_head = None  # lifelong.latent_shape_weight
+        self.aux_sum, self.aux_n, self.shape_sum = 0.0, 0, 0.0
+        self.aux_var = self.shape_var = None
         self.target_encoder = None
         self.latent_std = None
         self.sr_cond = self.sr_y = None
@@ -365,7 +372,8 @@ class SeedDriftER(ER):
             self.cur_steps = step_actions(dataset).to(self.cfg.device)
         if self.cfg.lifelong.get("latent_pred_weight", 0.0) > 0:
             dataset = WithPartner(dataset, self.cfg.lifelong.latent_pred_max_dt,
-                                  self.cfg.lifelong.get("latent_pred_signed", False), self._path_len() if self._flow() else 0)
+                                  self.cfg.lifelong.get("latent_pred_signed", False), self._path_len() if self._flow() else 0,
+                                  self._shape_dt())
         return super().learn_one_task(dataset, task_id, benchmark, result_summary)
 
     def end_task(self, dataset, task_id, benchmark, env=None):
@@ -498,6 +506,8 @@ class SeedDriftER(ER):
         Sequential.start_task(self, task)  # not ER.start_task (truncated per-task buffers)
         if self.cfg.lifelong.get("latent_pred_weight", 0.0) > 0:
             self.optimizer.add_param_group({"params": self._get_latent_head().parameters()})
+        if self._shape_dt() > 0:
+            self.optimizer.add_param_group({"params": self._get_shape_head().parameters()})
         self.seed_loader = None
         if self.current_task <= 0:
             return
@@ -877,6 +887,7 @@ class SeedDriftER(ER):
     def _old_flow_loss(self, data, cond, n_cur, sidx, nb_obs, nb_index=None):
         """Flow loss on old tasks: neighbouring seed pairs encoded now (seed_pairs) and self-replay targets."""
         R, P = self._image_dim(), self._prop_dim()
+        cond = cond if self._encoder_grad() else cond.detach()
         terms = []
         if nb_obs is not None and self._ar_len() > 0:
             # a random other seed of the demo, chained (both encoded now: seed online, partner with the EMA target)
@@ -913,6 +924,45 @@ class SeedDriftER(ER):
         else:
             os.makedirs(os.path.dirname(path), exist_ok=True)
             torch.save(self._get_latent_head().state_dict(), path)
+        if self._shape_dt() > 0:
+            path = os.path.join(self.experiment_dir, "seed_drift", f"shape_head_task{task_id}.pt")
+            if os.path.exists(path):
+                self._get_shape_head().load_state_dict(torch.load(path, map_location=self.cfg.device))
+            else:
+                torch.save(self._get_shape_head().state_dict(), path)
+
+    def _shape_dt(self):
+        """lifelong.latent_shape_weight > 0: steps up to the shaping partner (needs latent_pred_weight > 0); else 0."""
+        if self.cfg.lifelong.get("latent_shape_weight", 0.0) <= 0:
+            return 0
+        assert self.cfg.lifelong.get("latent_pred_weight", 0.0) > 0, "[error] latent_shape_weight needs latent_pred_weight"
+        return self.cfg.lifelong.get("latent_shape_max_dt", 16)
+
+    def _get_shape_head(self):
+        if self.shape_head is None:
+            R, P = self._image_dim(), self._prop_dim()
+            n_act = self.policy.horizon * self.cfg.shape_meta.ac_dim
+            self.shape_head = LatentHead(R + 2 * P + n_act + 1, R, self.cfg.lifelong.latent_pred_width).to(self.cfg.device)
+        return self.shape_head
+
+    def _shape_loss(self, zs, cur, near):
+        """
+        lifelong.latent_shape_weight: the regression latent prediction of run lpv01 as an encoder-shaping loss next to the
+        flow generator: F(x) predicted as F(s) + head(F(s), proprio of s and x, s's chunk up to x, dt) for x 1..shape_dt
+        steps later, target from the EMA encoder; F(s) in the prediction pulls neighbouring frames together.
+        """
+        policy, R, P = self.policy, self._image_dim(), self._prop_dim()
+        x_obs = policy._dp_batch({"obs": near["obs"], "task_emb": cur["task_emb"], "actions": cur["actions"]})["obs"]
+        with torch.no_grad():
+            zx = self._get_target_encoder()(policy.dp.normalizer.normalize(x_obs))
+        dt = near["dt"].float()
+        act = policy.dp.normalizer["action"].normalize(policy._dp_batch(cur)["action"])
+        act = act * (torch.arange(act.shape[1], device=act.device)[None, :, None] < dt[:, None, None])
+        inp = torch.cat([zs[:, :R], zs[:, R:R + P], zx[:, R:R + P], act.flatten(1), dt[:, None] / self._shape_dt()], 1)
+        pred = zs[:, :R] + self._get_shape_head()(inp)
+        var = zx[:, :R].var(0).mean()
+        self.shape_var = var if self.shape_var is None else 0.99 * self.shape_var + 0.01 * var
+        return ((pred - zx[:, :R]) ** 2).mean() / self.shape_var
 
     def _get_target_encoder(self):
         if self.target_encoder is None:
@@ -936,7 +986,7 @@ class SeedDriftER(ER):
         for t, o in zip(self.target_encoder.parameters(), self.policy.dp.obs_encoder.parameters()):
             t.mul_(m).add_(o.detach(), alpha=1 - m)
 
-    def _latent_pred_loss(self, cur, partner):
+    def _latent_pred_loss(self, cur, partner, near=None):
         """
         Prediction error of F(x) from F(s) + head(...), relative to a running mean (momentum 0.99) of the batches' mean
         per-dimension variance of F(x). The target F(x) comes from an EMA copy of the encoder (momentum
@@ -945,13 +995,14 @@ class SeedDriftER(ER):
         the batch's own variance gave loss spikes up to ~2500. The EMA target alone still shrank the latents (std 0.003
         vs 0.021 without the loss after 500 steps): the loss rewards removing what the head cannot predict from the
         motion. latent_pred_std_floor > 0 adds a VICReg variance term, mean_j relu(1 - std_j(F(s)) / floor) over the
-        image dims of the batch.
+        image dims of the batch. Returns (this loss, the shaping loss of _shape_loss or 0).
         """
         policy, enc = self.policy, self.policy.dp.obs_encoder
+        zero = torch.zeros((), device=cur["actions"].device)
         if cur["actions"].shape[0] < 2:
             # the batch std of a single sample is NaN (n - 1 = 0): the last batch of an epoch can have one sample
             # (ss10_t1_gen_sr went NaN in task 5 this way)
-            return torch.zeros((), device=cur["actions"].device)
+            return zero, zero
         R, P = self._image_dim(), self._prop_dim()
         s_batch = policy._dp_batch(cur)
         x_obs = policy._dp_batch({"obs": partner["obs"], "task_emb": cur["task_emb"], "actions": cur["actions"]})["obs"]
@@ -967,14 +1018,15 @@ class SeedDriftER(ER):
         if self._flow():
             # the encoder learns through the condition only: with F(s) in the target too it collapsed (smoke_flowgen:
             # latent std 0.002), since all-zero offsets make the flow trivial
+            z_head = zs if self._encoder_grad() else zs.detach()
             if self._ar_len() > 0:
                 # chains of steps <= ar_len frames toward partners up to latent_pred_max_dt away (pushforward: only the
                 # last step is trained, from the head's own rollout; single steps keep the encoder gradient)
                 a = partner["index"]
-                c, z_in = self._ar_last_step(zs[:, :R], a, a + partner["dt"], self.cur_prop, self.cur_steps)
+                c, z_in = self._ar_last_step(z_head[:, :R], a, a + partner["dt"], self.cur_prop, self.cur_steps)
                 loss = self.latent_head.loss(c, zx[:, :R] - z_in.detach())
             else:
-                c = self._flow_cond(zs[:, :R], zs[:, R:R + P], zx[:, R:R + P], partner["path"], partner["dt"])
+                c = self._flow_cond(z_head[:, :R], z_head[:, R:R + P], zx[:, R:R + P], partner["path"], partner["dt"])
                 loss = self.latent_head.loss(c, zx[:, :R] - zs[:, :R].detach())
         else:
             dt = partner["dt"].float()
@@ -991,21 +1043,27 @@ class SeedDriftER(ER):
         floor = self.cfg.lifelong.get("latent_pred_std_floor", 0.0)
         if floor > 0:
             loss = loss + torch.relu(1 - zs[:, :R].std(0) / floor).mean()
-        return loss
+        return loss, (self._shape_loss(zs, cur, near) if near is not None else zero)
 
-    def _add_latent_pred_loss(self, loss, cur, partner):
-        aux = self._latent_pred_loss(self.map_tensor_to_device(cur), self.map_tensor_to_device(partner))
+    def _encoder_grad(self):
+        return self.cfg.lifelong.get("latent_pred_encoder_grad", True)
+
+    def _add_latent_pred_loss(self, loss, cur, partner, near=None):
+        near = None if near is None else self.map_tensor_to_device(near)
+        aux, shape = self._latent_pred_loss(self.map_tensor_to_device(cur), self.map_tensor_to_device(partner), near)
         if self.n_steps == 1:
             print(f"[info] SeedDriftER: latent prediction loss at the first step of the task {aux.item():.4f} "
-                  f"(policy loss {loss.item():.4f})")
+                  f"(policy loss {loss.item():.4f}, shaping loss {shape.item():.4f})")
         self.aux_sum, self.aux_n = self.aux_sum + aux.item(), self.aux_n + 1
+        self.shape_sum += shape.item()
         if self.aux_n == 500:
             print(f"[info] SeedDriftER: latent prediction loss, mean of the last 500 steps {self.aux_sum / 500:.4f}, "
+                  f"shaping loss {self.shape_sum / 500:.4f}, "
                   f"image latent std {self.latent_std.item():.4f} (collapse check; ~0.13-0.16 without the loss)")
-            self.aux_sum, self.aux_n = 0.0, 0
+            self.aux_sum, self.aux_n, self.shape_sum = 0.0, 0, 0.0
         if os.environ.get("SDR_NAN_DEBUG"):
             getattr(self, "dbg_parts", {}).update({"latent_pred_loss": aux.item()})
-        return loss + self.cfg.lifelong.latent_pred_weight * aux
+        return loss + self.cfg.lifelong.latent_pred_weight * aux + self.cfg.lifelong.get("latent_shape_weight", 0.0) * shape
 
     def _nan_debug(self, loss):
         """SDR_NAN_DEBUG=1: every 50 steps (and at the first non-finite value, then stop) the loss, the gradient norms
@@ -1038,6 +1096,7 @@ class SeedDriftER(ER):
 
     def observe(self, data):
         partner = data.pop("partner", None)
+        near = data.pop("shape_partner", None)
         if self.seed_loader is None:
             if partner is None:
                 return Sequential.observe(self, data)
@@ -1045,7 +1104,7 @@ class SeedDriftER(ER):
             data = self.map_tensor_to_device(data)
             self.optimizer.zero_grad()
             loss = self.policy.compute_loss(data)
-            return self._optimizer_step(self._add_latent_pred_loss(loss, data, partner), loss)
+            return self._optimizer_step(self._add_latent_pred_loss(loss, data, partner, near), loss)
         cur = data
         mode = self.cfg.lifelong.drift_compensation
         per_step = mode.endswith("_grad")
@@ -1130,4 +1189,4 @@ class SeedDriftER(ER):
             total = loss
         if partner is None:
             return self._optimizer_step(total, loss)
-        return self._optimizer_step(self._add_latent_pred_loss(total, cur, partner), loss)
+        return self._optimizer_step(self._add_latent_pred_loss(total, cur, partner, near), loss)

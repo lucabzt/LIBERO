@@ -82,6 +82,14 @@ latent_pred_self_replay: false
 latent_pred_ar_len: 0
 # Euler steps when sampling offsets from the flow head (drift_compensation=pred_grad, self-replay)
 latent_pred_sample_steps: 10
+# false: the flow head reads detached latents (current- and old-task terms), a pure generator that does not shape the
+# encoder (the flow-shaped encoder was jittery and the newest tasks weak, experiments/2026-11-26_newest_task_plasticity)
+latent_pred_encoder_grad: true
+# encoder shaping by a separate regression head (the latent_pred_head=regression loss of run lpv01): weight of the loss
+# predicting F(x) as F(s) + head(F(s), proprio, chunk, dt) for a second partner x 1..latent_shape_max_dt steps later,
+# relative to the variance of F(x) (EMA target; latent_pred_train_crop applies); 0: off
+latent_shape_weight: 0.0
+latent_shape_max_dt: 16
 # re-encode the seeds and rebuild the replayed latents every refit_every training steps
 refit_every: 200
 # ridge strength toward the identity, relative to the mean eigenvalue of X^T X of the seeds
