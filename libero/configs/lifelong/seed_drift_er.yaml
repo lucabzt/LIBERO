@@ -59,6 +59,9 @@ latent_pred_target_momentum: 0.99
 # VICReg variance term against the collapse (EMA target alone still shrank the latents): mean over image dims of
 # relu(1 - batch std / latent_pred_std_floor), part of the latent prediction loss; 0: off
 latent_pred_std_floor: 0.0
+# latent prediction loss (seed latent, variance term, EMA targets) with the encoder in train mode (random crop) as the
+# policy loss; false: eval mode (center crop), which let the train- and eval-mode features drift apart
+latent_pred_train_crop: false
 # control: drop the prediction term, keep only the variance term (same partner loading and encoder passes)
 latent_pred_variance_only: false
 # regression (LatentHead, partner's offset from the seed's 16-step chunk) | flow (FlowOffsetHead: conditional flow of the

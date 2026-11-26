@@ -916,10 +916,19 @@ class SeedDriftER(ER):
 
     def _get_target_encoder(self):
         if self.target_encoder is None:
-            self.target_encoder = copy.deepcopy(self.policy.dp.obs_encoder).eval()
+            self.target_encoder = copy.deepcopy(self.policy.dp.obs_encoder).train(self._aux_train_crop())
             for q in self.target_encoder.parameters():
                 q.requires_grad = False
         return self.target_encoder
+
+    def _aux_train_crop(self):
+        """
+        lifelong.latent_pred_train_crop: the latent prediction loss (seed latent, variance term, EMA targets) on the
+        encoder in train mode (random crop), as the policy sees the current task. In eval mode (center crop, the
+        default) the variance term inflated only the center-crop features and the newest task failed at evaluation
+        (../2026-11-26_tr32_failure_analysis: task 4 closed loop 2 / 20 center crop vs 10 / 20 random crop).
+        """
+        return self.cfg.lifelong.get("latent_pred_train_crop", False)
 
     @torch.no_grad()
     def _update_target_encoder(self):
@@ -946,9 +955,12 @@ class SeedDriftER(ER):
         R, P = self._image_dim(), self._prop_dim()
         s_batch = policy._dp_batch(cur)
         x_obs = policy._dp_batch({"obs": partner["obs"], "task_emb": cur["task_emb"], "actions": cur["actions"]})["obs"]
-        enc.eval()
-        zs = enc(policy.dp.normalizer.normalize(s_batch["obs"]))
-        enc.train()
+        if self._aux_train_crop():
+            zs = enc(policy.dp.normalizer.normalize(s_batch["obs"]))
+        else:
+            enc.eval()
+            zs = enc(policy.dp.normalizer.normalize(s_batch["obs"]))
+            enc.train()
         with torch.no_grad():
             zx = self._get_target_encoder()(policy.dp.normalizer.normalize(x_obs))
         self.latent_std = zs[:, :R].detach().std(0).mean()
