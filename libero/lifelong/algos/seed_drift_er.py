@@ -336,6 +336,7 @@ class SeedDriftER(ER):
         self.replay_cost = {}
         self.latent_head = None
         self.shape_head = None  # lifelong.latent_shape_weight
+        self.idm_head = None  # lifelong.latent_shape_idm_weight
         self.aux_sum, self.aux_n, self.shape_sum = 0.0, 0, 0.0
         self.aux_var = self.shape_var = None
         self.target_encoder = None
@@ -512,6 +513,8 @@ class SeedDriftER(ER):
             self.optimizer.add_param_group({"params": self._get_latent_head().parameters()})
         if self._shape_dt() > 0:
             self.optimizer.add_param_group({"params": self._get_shape_head().parameters()})
+            if self.cfg.lifelong.get("latent_shape_idm_weight", 0.0) > 0:
+                self.optimizer.add_param_group({"params": self._get_idm_head().parameters()})
         self.seed_loader = None
         if self.current_task <= 0:
             return
@@ -1036,7 +1039,29 @@ class SeedDriftER(ER):
         pred = zs[:, :R] + self._get_shape_head()(inp)
         var = zx[:, :R].var(0).mean()
         self.shape_var = var if self.shape_var is None else 0.99 * self.shape_var + 0.01 * var
-        return ((pred - zx[:, :R]) ** 2).mean() / self.shape_var
+        loss = ((pred - zx[:, :R]) ** 2).mean() / self.shape_var
+        lc = self.cfg.lifelong
+        # PLDM's other terms (arXiv 2502.14819): decorrelation (here of the correlation matrix, scale-free), time
+        # smoothness toward the near partner's target latent, inverse dynamics (the chunk s -> x from both latents)
+        if lc.get("latent_shape_cov_weight", 0.0) > 0:
+            corr = torch.corrcoef(zs[:, :R].T)
+            off = ~torch.eye(R, dtype=torch.bool, device=corr.device)
+            loss = loss + lc.latent_shape_cov_weight * (corr[off] ** 2).mean()
+        if lc.get("latent_shape_time_weight", 0.0) > 0:
+            loss = loss + lc.latent_shape_time_weight * ((zs[:, :R] - zx[:, :R]) ** 2).mean() / self.shape_var
+        if lc.get("latent_shape_idm_weight", 0.0) > 0:
+            pred_act = self._get_idm_head()(torch.cat([zs[:, :R], zx[:, :R], dt[:, None] / self._shape_dt()], 1))
+            mask = (torch.arange(act.shape[1], device=act.device)[None, :, None] < dt[:, None, None]).float()
+            loss = loss + lc.latent_shape_idm_weight * (((pred_act.view_as(act) - act) ** 2) * mask).sum() / (
+                mask.sum() * act.shape[2])
+        return loss
+
+    def _get_idm_head(self):
+        """lifelong.latent_shape_idm_weight: inverse dynamics, the (masked) chunk from s to x given F(s), F(x), dt."""
+        if self.idm_head is None:
+            R, n_act = self._image_dim(), self.policy.horizon * self.cfg.shape_meta.ac_dim
+            self.idm_head = LatentHead(2 * R + 1, n_act, self.cfg.lifelong.latent_pred_width).to(self.cfg.device)
+        return self.idm_head
 
     def _get_target_encoder(self):
         if self.target_encoder is None:

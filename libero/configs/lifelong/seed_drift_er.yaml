@@ -92,6 +92,12 @@ latent_shape_weight: 0.0
 latent_shape_max_dt: 16
 # the shaping target encoder cuts the same random crop as the online encoder (independent crops collapsed the latents)
 latent_shape_same_crop: false
+# PLDM's further shaping terms (relative to the regression term, inside latent_shape_weight; 0: off): mean squared
+# off-diagonal correlation of the image latents, time smoothness |F(s) - F_target(x)|^2 / var, inverse dynamics (MSE of
+# the masked chunk s -> x predicted from F(s), F_target(x), dt)
+latent_shape_cov_weight: 0.0
+latent_shape_time_weight: 0.0
+latent_shape_idm_weight: 0.0
 # share of each task's non-seed samples kept as stored latents (random, fixed per seed and task); 1: all. With a frozen
 # obs encoder and drift_compensation=none: plain latent replay of that many latents
 latent_fraction: 1.0
