@@ -1014,15 +1014,20 @@ class SeedDriftER(ER):
             self.shape_head = LatentHead(R + 2 * P + n_act + 1, R, self.cfg.lifelong.latent_pred_width).to(self.cfg.device)
         return self.shape_head
 
-    def _shape_loss(self, zs, cur, near):
+    def _shape_loss(self, zs, cur, near, crop_state):
         """
         lifelong.latent_shape_weight: the regression latent prediction of run lpv01 as an encoder-shaping loss next to the
         flow generator: F(x) predicted as F(s) + head(F(s), proprio of s and x, s's chunk up to x, dt) for x 1..shape_dt
         steps later, target from the EMA encoder; F(s) in the prediction pulls neighbouring frames together.
+        lifelong.latent_shape_same_crop: the target encoder cuts the same random crop as the online encoder did for F(s)
+        (torchvision RandomCrop draws one position per camera and call from the CPU generator; crop_state is its state
+        before the online call). With independent crops run ss5_tr32_ar16shape_gen_sr collapsed.
         """
         policy, R, P = self.policy, self._image_dim(), self._prop_dim()
         x_obs = policy._dp_batch({"obs": near["obs"], "task_emb": cur["task_emb"], "actions": cur["actions"]})["obs"]
         with torch.no_grad():
+            if self.cfg.lifelong.get("latent_shape_same_crop", False):
+                torch.set_rng_state(crop_state)
             zx = self._get_target_encoder()(policy.dp.normalizer.normalize(x_obs))
         dt = near["dt"].float()
         act = policy.dp.normalizer["action"].normalize(policy._dp_batch(cur)["action"])
@@ -1075,6 +1080,7 @@ class SeedDriftER(ER):
         R, P = self._image_dim(), self._prop_dim()
         s_batch = policy._dp_batch(cur)
         x_obs = policy._dp_batch({"obs": partner["obs"], "task_emb": cur["task_emb"], "actions": cur["actions"]})["obs"]
+        crop_state = torch.get_rng_state()  # lifelong.latent_shape_same_crop
         if self._aux_train_crop():
             zs = enc(policy.dp.normalizer.normalize(s_batch["obs"]))
         else:
@@ -1112,7 +1118,7 @@ class SeedDriftER(ER):
         floor = self.cfg.lifelong.get("latent_pred_std_floor", 0.0)
         if floor > 0:
             loss = loss + torch.relu(1 - zs[:, :R].std(0) / floor).mean()
-        return loss, (self._shape_loss(zs, cur, near) if near is not None else zero)
+        return loss, (self._shape_loss(zs, cur, near, crop_state) if near is not None else zero)
 
     def _encoder_grad(self):
         return self.cfg.lifelong.get("latent_pred_encoder_grad", True)
