@@ -416,6 +416,10 @@ class SeedDriftER(ER):
             torch.save(entry, path)
             print(f"[info] SeedDriftER: task {task_id}: {X.shape[0]} samples stored as latents, "
                   f"{len(seeds)} {self.cfg.lifelong.get('seed_selection', 'kmeans')} seeds raw ({len(seeds) / X.shape[0]:.2%}), {time.time() - t0:.0f} s")
+        frac = self.cfg.lifelong.get("latent_fraction", 1.0)
+        if frac < 1:
+            g = torch.Generator().manual_seed(self.cfg.seed * 1000 + task_id)
+            entry["keep"] = (torch.rand(len(entry["cond"]), generator=g) < frac).to(entry["assign"].device)
         self.store.append(entry)
         if self.cfg.lifelong.get("generator", "none") != "none":
             if self.cfg.lifelong.get("gen_shared", False):
@@ -526,6 +530,8 @@ class SeedDriftER(ER):
         seed_ds = Indexed(seed_all)
         if self._ar_len() > 0:
             self._setup_ar_tables()
+            if lc.get("latent_pred_pretrain_steps", 0) > 0 and task == self.cfg.get("pretrain_n_tasks", 0):
+                self._pretrain_latent_head()
         if self._flow() and lc.get("latent_pred_seed_pairs", False):
             if self._ar_len() > 0:
                 seed_ds = WithSeedPartner(seed_all, self._seed_partners())
@@ -593,6 +599,7 @@ class SeedDriftER(ER):
                 "buffer_bytes_generator": int(n_seed * raw_b + n_seed * 2 * R + n_lat * (side + 2) + gen_b)})
             print(f"[info] SeedDriftER generator storage: {gen_b / 1e6:.1f} MB generators + {side} B/sample "
                   f"side info, total {self.replay_cost['buffer_bytes_generator'] / 1e6:.1f} MB")
+        self._print_storage_fp16(n_seed, n_lat)
         n_save = self.cfg.lifelong.get("gen_save_samples", 0)
         if n_save > 0 and (self.generators or self.shared_gen is not None):
             self._save_generated_samples(task, n_save)
@@ -603,10 +610,36 @@ class SeedDriftER(ER):
 
     @staticmethod
     def _nonseed(e):
-        """Replayed latents: samples that are not seeds and have a seed (trajectory seeds leave demos uncovered)."""
+        """
+        Replayed latents: samples that are not seeds and have a seed (trajectory seeds leave demos uncovered), only the
+        kept share with lifelong.latent_fraction < 1.
+        """
         m = e["assign"] >= 0
+        if "keep" in e:
+            m = m & e["keep"]
         m[e["seeds"]] = False
         return m
+
+    def _print_storage_fp16(self, n_seed, n_lat):
+        """
+        Storage of the replayed memory in fp16, seeds counted as latent samples (frozen encoder): latent replay stores
+        image latent + proprio + action chunk per sample, pred_grad / noise_grad proprio + action chunk per member (+ the
+        offset norm for noise_grad) and pred_grad the flow head (experiments/2026-11-27_generator_vs_latent_equal_storage).
+        """
+        R, P = self._image_dim(), self._prop_dim()
+        n_act = self.policy.horizon * self.cfg.shape_meta.ac_dim
+        lat16, side16 = 2 * (R + P + n_act), 2 * (P + n_act)
+        mode = self.cfg.lifelong.drift_compensation
+        if mode == "pred_grad":
+            head = 2 * sum(p.numel() for p in self._get_latent_head().parameters())
+            total = n_seed * lat16 + n_lat * side16 + head
+        elif mode == "noise_grad":
+            head, total = 0, n_seed * lat16 + n_lat * (side16 + 2)
+        else:
+            head, total = 0, (n_seed + n_lat) * lat16
+        self.replay_cost["storage_bytes_fp16"] = int(total)
+        print(f"[info] SeedDriftER storage (fp16, seeds as latents, {mode}): {n_seed} seeds + {n_lat} replayed samples, "
+              f"head {head / 1e6:.2f} MB, total {total / 1e6:.2f} MB")
 
     def _bytes_per_sample(self):
         meta = self.cfg.shape_meta["all_shapes"]
@@ -764,6 +797,42 @@ class SeedDriftER(ER):
         self.old_prop = torch.cat([e["cond"][:, R:R + P] for e in self.store])
         self.old_steps = torch.cat([e["actions"][:, 0] for e in self.store]).to(dev)
         self.seed_g = torch.cat([b + e["seeds"].to(dev) for b, e in zip(self.old_base, self.store)])
+
+    def _pretrain_latent_head(self):
+        """
+        lifelong.latent_pred_pretrain_steps (pretrain_n_tasks, frozen obs encoder): before the first continual task the
+        flow head is fit on all pretrained tasks at once, on their stored latents (exact for a frozen encoder): partners
+        up to latent_pred_max_dt steps before / after in the demo, AR-chained and trained on the last step as the
+        current-task loss.
+        """
+        assert self.cfg.policy.get("freeze_obs_encoder", False), "[error] latent_pred_pretrain_steps needs a frozen encoder"
+        R, dev, L = self._image_dim(), self.cfg.device, self.cfg.lifelong.latent_pred_max_dt
+        lat = torch.cat([e["cond"][:, :R] for e in self.store]).float()
+        demo, ts = zip(*[demo_and_time(ds) for ds in self.datasets])
+        demo = torch.cat([d + 1000 * j for j, d in enumerate(demo)]).to(dev)
+        ts = torch.cat(ts).to(dev)
+        _, inv, counts = torch.unique(demo, return_inverse=True, return_counts=True)
+        lo, hi = -ts.clamp(max=L), (counts[inv] - 1 - ts).clamp(max=L)
+        head = self._get_latent_head().train()
+        opt = torch.optim.Adam(head.parameters(), lr=self.cfg.train.optimizer.kwargs.lr)
+        g = torch.Generator(device=dev).manual_seed(self.cfg.seed)
+        steps, total = self.cfg.lifelong.latent_pred_pretrain_steps, 0.0
+        t0 = time.time()
+        for step in range(steps):
+            i = torch.randint(len(lat), (256,), device=dev, generator=g)
+            i = i[hi[i] > lo[i]]
+            r = lo[i] + (torch.rand(len(i), device=dev, generator=g) * (hi[i] - lo[i])).long()
+            dt = r + (r >= 0).long()  # lo..-1 and 1..hi
+            c, z_in = self._ar_last_step(lat[i], i, i + dt, self.old_prop, self.old_steps)
+            loss = head.loss(c, lat[i + dt] - z_in)
+            opt.zero_grad()
+            loss.backward()
+            opt.step()
+            total += loss.item()
+            if (step + 1) % 2000 == 0:
+                print(f"[info] SeedDriftER flow head pretraining on {len(self.store)} tasks: step {step + 1} / {steps}, "
+                      f"loss {total / 2000:.4f}, {time.time() - t0:.0f} s", flush=True)
+                total = 0.0
 
     def _seed_partners(self):
         """For every seed (index into all past seeds) the other seeds of its demo."""

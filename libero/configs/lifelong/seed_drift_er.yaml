@@ -90,6 +90,12 @@ latent_pred_encoder_grad: true
 # relative to the variance of F(x) (EMA target; latent_pred_train_crop applies); 0: off
 latent_shape_weight: 0.0
 latent_shape_max_dt: 16
+# share of each task's non-seed samples kept as stored latents (random, fixed per seed and task); 1: all. With a frozen
+# obs encoder and drift_compensation=none: plain latent replay of that many latents
+latent_fraction: 1.0
+# with pretrain_n_tasks and a frozen obs encoder: steps (batch 256) fitting the flow head on all pretrained tasks' stored
+# latents before the first continual task; 0: off
+latent_pred_pretrain_steps: 0
 # re-encode the seeds and rebuild the replayed latents every refit_every training steps
 refit_every: 200
 # ridge strength toward the identity, relative to the mean eigenvalue of X^T X of the seeds
