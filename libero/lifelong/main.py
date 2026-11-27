@@ -355,7 +355,8 @@ def main(hydra_cfg):
         # the last one (only the last row of the confusion matrices is filled)
         final_only = bool(cfg.eval.get("final_only", False))
         if final_only:
-            assert n_pretrain == 0 and gsz == 1, "[error] eval.final_only needs pretrain_n_tasks 0, task_group_size 1"
+            # with pretrain_n_tasks the pretrained row is filled above, the final evaluation fills the last row
+            assert gsz == 1, "[error] eval.final_only needs task_group_size 1"
         for i in range(n_tasks_done, n_tasks_run):
             print(f"[info] start training on task {i}")
             algo.train()
