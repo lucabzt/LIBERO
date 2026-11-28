@@ -337,6 +337,10 @@ class SeedDriftER(ER):
         self.latent_head = None
         self.shape_head = None  # lifelong.latent_shape_weight
         self.idm_head = None  # lifelong.latent_shape_idm_weight
+        # lifelong.latent_pred_code_dim: per finished task its demos' codes and every frame's demo; the current task's
+        # codes (trainable) and frames' demos
+        self.code_tables, self.task_demo = [], []
+        self.cur_codes = self.cur_demo = None
         self.aux_sum, self.aux_n, self.shape_sum = 0.0, 0, 0.0
         self.aux_var = self.shape_var = None
         self.target_encoder = None
@@ -371,6 +375,13 @@ class SeedDriftER(ER):
             R, P = self._image_dim(), self._prop_dim()
             self.cur_prop = self._encode(dataset)[0][:, R:R + P]
             self.cur_steps = step_actions(dataset).to(self.cfg.device)
+            if self._code_dim() > 0:
+                # a learned code per demo (auto-decoder as DeepSDF / GLO), stored at the end of the task: the offline
+                # study experiments/2026-11-27_generator_context_study (width 1024, 100k steps: 0.37 -> 0.27 rel. error)
+                assert int(self.cfg.get("pretrain_n_tasks", 0) or 0) == 0, "[error] latent_pred_code_dim without pretraining"
+                demo, _ = demo_and_time(dataset)
+                self.cur_demo = demo.to(self.cfg.device)
+                self.cur_codes = nn.Parameter(torch.zeros(int(demo.max()) + 1, self._code_dim(), device=self.cfg.device))
         if self.cfg.lifelong.get("latent_pred_weight", 0.0) > 0:
             dataset = WithPartner(dataset, self.cfg.lifelong.latent_pred_max_dt,
                                   self.cfg.lifelong.get("latent_pred_signed", False), self._path_len() if self._flow() else 0,
@@ -421,6 +432,12 @@ class SeedDriftER(ER):
             g = torch.Generator().manual_seed(self.cfg.seed * 1000 + task_id)
             entry["keep"] = (torch.rand(len(entry["cond"]), generator=g) < frac).to(entry["assign"].device)
         self.store.append(entry)
+        if self._code_dim() > 0:
+            demo, _ = demo_and_time(dataset)
+            self.task_demo.append(demo.to(self.cfg.device))
+            # trained during the task; a resumed run reloads the saved codes (_save_or_load_latent_head)
+            self.code_tables.append(self.cur_codes if self.cur_codes is not None else
+                                    torch.zeros(int(demo.max()) + 1, self._code_dim(), device=self.cfg.device))
         if self.cfg.lifelong.get("latent_pred_weight", 0.0) > 0:
             end_steps = self.cfg.lifelong.get("latent_pred_end_steps", 0)
             if end_steps > 0 and not head_saved and task_id >= self.cfg.get("pretrain_n_tasks", 0):
@@ -515,6 +532,8 @@ class SeedDriftER(ER):
         Sequential.start_task(self, task)  # not ER.start_task (truncated per-task buffers)
         if self.cfg.lifelong.get("latent_pred_weight", 0.0) > 0:
             self.optimizer.add_param_group({"params": self._get_latent_head().parameters()})
+            if self.cur_codes is not None:
+                self.optimizer.add_param_group({"params": [self.cur_codes], "lr": 10 * self.cfg.train.optimizer.kwargs.lr})
         if self._shape_dt() > 0:
             self.optimizer.add_param_group({"params": self._get_shape_head().parameters()})
             if self.cfg.lifelong.get("latent_shape_idm_weight", 0.0) > 0:
@@ -639,6 +658,7 @@ class SeedDriftER(ER):
         mode = self.cfg.lifelong.drift_compensation
         if mode == "pred_grad":
             head = 2 * sum(p.numel() for p in self._get_latent_head().parameters())
+            head += 2 * sum(c.numel() for c in self.code_tables)  # per-demo codes (lifelong.latent_pred_code_dim)
             total = n_seed * lat16 + n_lat * side16 + head
         elif mode == "noise_grad":
             head, total = 0, n_seed * lat16 + n_lat * (side16 + 2)
@@ -804,6 +824,17 @@ class SeedDriftER(ER):
         self.old_prop = torch.cat([e["cond"][:, R:R + P] for e in self.store])
         self.old_steps = torch.cat([e["actions"][:, 0] for e in self.store]).to(dev)
         self.seed_g = torch.cat([b + e["seeds"].to(dev) for b, e in zip(self.old_base, self.store)])
+        # lifelong.latent_pred_code_dim: the per-demo code of every old frame (the last task's codes still trainable
+        # during its end-of-task training)
+        self.old_code = (torch.cat([codes[demo] for codes, demo in zip(self.code_tables, self.task_demo)])
+                         if self._code_dim() > 0 else None)
+
+    def _code_dim(self):
+        return self.cfg.lifelong.get("latent_pred_code_dim", 0)
+
+    def _cur_code_table(self):
+        """Per frame of the current task its demo's code (trainable), None without codes."""
+        return self.cur_codes[self.cur_demo] if self._code_dim() > 0 else None
 
     def _pretrain_latent_head(self):
         """
@@ -836,14 +867,18 @@ class SeedDriftER(ER):
                             for j, b in enumerate(self.old_base) if j in tasks])
         frames = frames[hi[frames] > lo[frames]]
         head = self._get_latent_head().train()
-        opt = torch.optim.Adam(head.parameters(), lr=self.cfg.train.optimizer.kwargs.lr)
+        lr = self.cfg.train.optimizer.kwargs.lr
+        groups = [{"params": head.parameters(), "lr": lr}]
+        if self.cur_codes is not None:  # the finished task's codes, part of self.old_code
+            groups.append({"params": [self.cur_codes], "lr": 10 * lr})
+        opt = torch.optim.Adam(groups)
         g = torch.Generator(device=dev).manual_seed(self.cfg.seed + 1000 * len(self.store))
         total, t0 = 0.0, time.time()
         for step in range(steps):
             i = frames[torch.randint(len(frames), (256,), device=dev, generator=g)]
             r = lo[i] + (torch.rand(len(i), device=dev, generator=g) * (hi[i] - lo[i])).long()
             dt = r + (r >= 0).long()  # lo..-1 and 1..hi
-            c, z_in = self._ar_last_step(lat[i], i, i + dt, self.old_prop, self.old_steps)
+            c, z_in = self._ar_last_step(lat[i], i, i + dt, self.old_prop, self.old_steps, self.old_code)
             loss = head.loss(c, lat[i + dt] - z_in)
             if self.sr_cond is not None:
                 k = torch.randint(len(self.sr_cond), (256,), device=dev, generator=g)
@@ -872,11 +907,11 @@ class SeedDriftER(ER):
         return out
 
     @torch.no_grad()
-    def _ar_chain(self, z, a, b, prop, steps, to_last_step):
+    def _ar_chain(self, z, a, b, prop, steps, to_last_step, code=None):
         """
-        Steps of at most latent_pred_ar_len frames from frame a toward frame b (index tensors into prop / steps), each
-        from the head's own sample of the previous one, starting at latent z. to_last_step: stop one step short (the
-        caller trains that step, pushforward); else run to b. Returns the latent and the frame reached.
+        Steps of at most latent_pred_ar_len frames from frame a toward frame b (index tensors into prop / steps / code),
+        each from the head's own sample of the previous one, starting at latent z. to_last_step: stop one step short
+        (the caller trains that step, pushforward); else run to b. Returns the latent and the frame reached.
         """
         L, n_steps = self._ar_len(), self.cfg.lifelong.get("latent_pred_sample_steps", 10)
         z, cur = z.clone(), a.clone()
@@ -886,35 +921,41 @@ class SeedDriftER(ER):
             if len(i) == 0:
                 return z, cur
             nxt = cur[i] + rem[i].clamp(-L, L)
-            c = self._flow_cond(z[i], prop[cur[i]], prop[nxt], action_paths(steps, cur[i], nxt, L), nxt - cur[i])
+            c = self._flow_cond(z[i], prop[cur[i]], prop[nxt], action_paths(steps, cur[i], nxt, L), nxt - cur[i],
+                                None if code is None else code[cur[i]].detach())
             z[i] = z[i] + self.latent_head.sample(c, n_steps)
             cur[i] = nxt
 
-    def _ar_last_step(self, z, a, b, prop, steps):
+    def _ar_last_step(self, z, a, b, prop, steps, code=None):
         """Condition of the last step of the chain a -> b (single steps: from z itself, with its gradient)."""
-        z_in, cur = self._ar_chain(z.detach(), a, b, prop, steps, to_last_step=True)
+        z_in, cur = self._ar_chain(z.detach(), a, b, prop, steps, to_last_step=True, code=code)
         z_in = torch.where((cur == a)[:, None], z, z_in)
         L = self._ar_len()
-        return self._flow_cond(z_in, prop[cur], prop[b], action_paths(steps, cur, b, L), b - cur), z_in
+        return self._flow_cond(z_in, prop[cur], prop[b], action_paths(steps, cur, b, L), b - cur,
+                               None if code is None else code[cur]), z_in
 
     def _get_latent_head(self):
         if self.latent_head is None:
             R, P = self._image_dim(), self._prop_dim()
             width = self.cfg.lifelong.latent_pred_width
             if self._flow():
-                d_cond = R + 2 * P + self._path_len() * self.cfg.shape_meta.ac_dim + 1
+                d_cond = R + 2 * P + self._path_len() * self.cfg.shape_meta.ac_dim + 1 + self._code_dim()
                 self.latent_head = FlowOffsetHead(R, d_cond, width).to(self.cfg.device)
             else:
                 n_act = self.policy.horizon * self.cfg.shape_meta.ac_dim
                 self.latent_head = LatentHead(R + 2 * P + n_act + 1, R, width).to(self.cfg.device)
         return self.latent_head
 
-    def _flow_cond(self, z_s, prop_s, prop_x, path, dt):
-        """Flow head condition: seed latent, proprio of seed and sample, normalized action path, signed steps / path_len."""
+    def _flow_cond(self, z_s, prop_s, prop_x, path, dt, code=None):
+        """
+        Flow head condition: seed latent, proprio of seed and sample, normalized action path, signed steps / path_len,
+        and with lifelong.latent_pred_code_dim the code of the demo.
+        """
         L = self._path_len()
         mask = (torch.arange(L, device=path.device)[None] < dt.abs().clamp(max=L)[:, None])[..., None]
         path = self.policy.dp.normalizer["action"].normalize(path) * mask
-        return torch.cat([z_s, prop_s, prop_x, path.flatten(1), dt.float()[:, None] / L], 1)
+        parts = [z_s, prop_s, prop_x, path.flatten(1), dt.float()[:, None] / L]
+        return torch.cat(parts if code is None else parts + [code], 1)
 
     def _seed_neighbors(self):
         """
@@ -966,8 +1007,9 @@ class SeedDriftER(ER):
         self.policy.eval()
         cur = torch.cat([self.policy.encode_latents(d)[0].float() for d in self.seed_batches])
         self.policy.train(was_training)
+        code = None if self.old_code is None else self.old_code[self.old_base[self.lat_task] + self.lat_sample]
         c = self._flow_cond(cur[self.lat_seed, :R], cur[self.lat_seed, R:R + P], self.lat_low[:, :P], self.lat_path,
-                            self.lat_dsteps)
+                            self.lat_dsteps, code)
         if self._ar_len() > 0:  # single steps only: members at most ar_len frames from their seed
             c = c[self.lat_dsteps.abs() <= self._ar_len()]
         n_steps = self.cfg.lifelong.get("latent_pred_sample_steps", 10)
@@ -990,7 +1032,8 @@ class SeedDriftER(ER):
             a, b = self.seed_g[sidx], self.seed_g[nb_index]
             v = a != b
             if v.any():
-                c, z_in = self._ar_last_step(cond[n_cur:, :R][v], a[v], b[v], self.old_prop, self.old_steps)
+                c, z_in = self._ar_last_step(cond[n_cur:, :R][v], a[v], b[v], self.old_prop, self.old_steps,
+                                             self.old_code)
                 terms.append(self.latent_head.loss(c, zn[v, :R] - z_in.detach()))
         elif nb_obs is not None:
             v = self.seed_nb_valid[sidx]
@@ -1016,6 +1059,14 @@ class SeedDriftER(ER):
         else:
             os.makedirs(os.path.dirname(path), exist_ok=True)
             torch.save(self._get_latent_head().state_dict(), path)
+        if self._code_dim() > 0:
+            path = os.path.join(self.experiment_dir, "seed_drift", f"demo_codes_task{task_id}.pt")
+            if os.path.exists(path):
+                self.code_tables[task_id] = torch.load(path, map_location=self.cfg.device)
+            else:
+                torch.save(self.code_tables[task_id].detach().cpu(), path)
+            self.code_tables[task_id] = self.code_tables[task_id].detach().clone().to(self.cfg.device)
+            self.cur_codes = None
         if self._shape_dt() > 0:
             path = os.path.join(self.experiment_dir, "seed_drift", f"shape_head_task{task_id}.pt")
             if os.path.exists(path):
@@ -1143,7 +1194,8 @@ class SeedDriftER(ER):
                 # chains of steps <= ar_len frames toward partners up to latent_pred_max_dt away (pushforward: only the
                 # last step is trained, from the head's own rollout; single steps keep the encoder gradient)
                 a = partner["index"]
-                c, z_in = self._ar_last_step(z_head[:, :R], a, a + partner["dt"], self.cur_prop, self.cur_steps)
+                c, z_in = self._ar_last_step(z_head[:, :R], a, a + partner["dt"], self.cur_prop, self.cur_steps,
+                                             self._cur_code_table())
                 loss = self.latent_head.loss(c, zx[:, :R] - z_in.detach())
             else:
                 c = self._flow_cond(z_head[:, :R], z_head[:, R:R + P], zx[:, R:R + P], partner["path"], partner["dt"])
@@ -1270,6 +1322,7 @@ class SeedDriftER(ER):
                     z0 = seed_img.detach()
                     x_g = self.old_base[self.lat_task[mem]] + self.lat_sample[mem]
                     z, _ = self._ar_chain(z0, self.seed_g[self.lat_seed[mem]], x_g, self.old_prop, self.old_steps,
+                                          code=self.old_code,
                                           to_last_step=False)
                     off = z - z0
                 else:

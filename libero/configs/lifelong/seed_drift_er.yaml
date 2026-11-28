@@ -108,6 +108,9 @@ latent_pred_pretrain_steps: 0
 # that point), half of each step on the self-replay targets of older tasks; 0: off (the head trains only next to the
 # policy, ~9k steps at batch 32 per task)
 latent_pred_end_steps: 0
+# AR flow head: a learned code of this size per demo as extra condition (trained with the head during the task and its
+# end-of-task training, stored at the end of the task, 2 B per dim and demo); 0: off. Not with pretrain_n_tasks
+latent_pred_code_dim: 0
 # re-encode the seeds and rebuild the replayed latents every refit_every training steps
 refit_every: 200
 # ridge strength toward the identity, relative to the mean eigenvalue of X^T X of the seeds
