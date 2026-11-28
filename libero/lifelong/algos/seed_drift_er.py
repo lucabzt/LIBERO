@@ -380,8 +380,7 @@ class SeedDriftER(ER):
     def end_task(self, dataset, task_id, benchmark, env=None):
         if isinstance(dataset, WithPartner):
             dataset = dataset.dataset
-        if self.cfg.lifelong.get("latent_pred_weight", 0.0) > 0:
-            self._save_or_load_latent_head(task_id)
+        head_saved = os.path.exists(os.path.join(self.experiment_dir, "seed_drift", f"latent_head_task{task_id}.pt"))
         super().end_task(dataset, task_id, benchmark)  # self.datasets.append
         path = os.path.join(self.experiment_dir, "seed_drift", f"task{task_id}.pt")
         R = self._image_dim()
@@ -422,6 +421,11 @@ class SeedDriftER(ER):
             g = torch.Generator().manual_seed(self.cfg.seed * 1000 + task_id)
             entry["keep"] = (torch.rand(len(entry["cond"]), generator=g) < frac).to(entry["assign"].device)
         self.store.append(entry)
+        if self.cfg.lifelong.get("latent_pred_weight", 0.0) > 0:
+            end_steps = self.cfg.lifelong.get("latent_pred_end_steps", 0)
+            if end_steps > 0 and not head_saved and task_id >= self.cfg.get("pretrain_n_tasks", 0):
+                self._fit_latent_head([task_id], end_steps, "end-of-task training")
+            self._save_or_load_latent_head(task_id)
         if self.cfg.lifelong.get("generator", "none") != "none":
             if self.cfg.lifelong.get("gen_shared", False):
                 self._fit_shared_generator(task_id)
@@ -809,6 +813,18 @@ class SeedDriftER(ER):
         current-task loss.
         """
         assert self.cfg.policy.get("freeze_obs_encoder", False), "[error] latent_pred_pretrain_steps needs a frozen encoder"
+        self._fit_latent_head(list(range(len(self.store))), self.cfg.lifelong.latent_pred_pretrain_steps, "pretraining")
+
+    def _fit_latent_head(self, tasks, steps, label):
+        """
+        Head-only training of the flow head (batch 256, own Adam) on all frames of the stored tasks `tasks`: partners up
+        to latent_pred_max_dt steps before / after in the demo, AR-chained and trained on the last step as the
+        current-task loss; with self-replay targets of older tasks (self.sr_cond) half of every step on those
+        (lifelong.latent_pred_end_steps; the offline study experiments/2026-11-27_generator_context_study found the head
+        undertrained: 100k instead of 20k steps nearly halved its error).
+        """
+        assert self._ar_len() > 0, "[error] head-only training is implemented for the AR generator"
+        self._setup_ar_tables()
         R, dev, L = self._image_dim(), self.cfg.device, self.cfg.lifelong.latent_pred_max_dt
         lat = torch.cat([e["cond"][:, :R] for e in self.store]).float()
         demo, ts = zip(*[demo_and_time(ds) for ds in self.datasets])
@@ -816,24 +832,28 @@ class SeedDriftER(ER):
         ts = torch.cat(ts).to(dev)
         _, inv, counts = torch.unique(demo, return_inverse=True, return_counts=True)
         lo, hi = -ts.clamp(max=L), (counts[inv] - 1 - ts).clamp(max=L)
+        frames = torch.cat([b + torch.arange(len(self.store[j]["cond"]), device=dev)
+                            for j, b in enumerate(self.old_base) if j in tasks])
+        frames = frames[hi[frames] > lo[frames]]
         head = self._get_latent_head().train()
         opt = torch.optim.Adam(head.parameters(), lr=self.cfg.train.optimizer.kwargs.lr)
-        g = torch.Generator(device=dev).manual_seed(self.cfg.seed)
-        steps, total = self.cfg.lifelong.latent_pred_pretrain_steps, 0.0
-        t0 = time.time()
+        g = torch.Generator(device=dev).manual_seed(self.cfg.seed + 1000 * len(self.store))
+        total, t0 = 0.0, time.time()
         for step in range(steps):
-            i = torch.randint(len(lat), (256,), device=dev, generator=g)
-            i = i[hi[i] > lo[i]]
+            i = frames[torch.randint(len(frames), (256,), device=dev, generator=g)]
             r = lo[i] + (torch.rand(len(i), device=dev, generator=g) * (hi[i] - lo[i])).long()
             dt = r + (r >= 0).long()  # lo..-1 and 1..hi
             c, z_in = self._ar_last_step(lat[i], i, i + dt, self.old_prop, self.old_steps)
             loss = head.loss(c, lat[i + dt] - z_in)
+            if self.sr_cond is not None:
+                k = torch.randint(len(self.sr_cond), (256,), device=dev, generator=g)
+                loss = 0.5 * (loss + head.loss(self.sr_cond[k], self.sr_y[k]))
             opt.zero_grad()
             loss.backward()
             opt.step()
             total += loss.item()
             if (step + 1) % 2000 == 0:
-                print(f"[info] SeedDriftER flow head pretraining on {len(self.store)} tasks: step {step + 1} / {steps}, "
+                print(f"[info] SeedDriftER flow head {label} on tasks {tasks}: step {step + 1} / {steps}, "
                       f"loss {total / 2000:.4f}, {time.time() - t0:.0f} s", flush=True)
                 total = 0.0
 

@@ -104,6 +104,10 @@ latent_fraction: 1.0
 # with pretrain_n_tasks and a frozen obs encoder: steps (batch 256) fitting the flow head on all pretrained tasks' stored
 # latents before the first continual task; 0: off
 latent_pred_pretrain_steps: 0
+# AR flow head: head-only steps (batch 256) at the end of every task on its stored latents (exact for the encoder at
+# that point), half of each step on the self-replay targets of older tasks; 0: off (the head trains only next to the
+# policy, ~9k steps at batch 32 per task)
+latent_pred_end_steps: 0
 # re-encode the seeds and rebuild the replayed latents every refit_every training steps
 refit_every: 200
 # ridge strength toward the identity, relative to the mean eigenvalue of X^T X of the seeds
