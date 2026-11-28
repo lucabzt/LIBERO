@@ -321,6 +321,8 @@ class SeedDriftER(ER):
     Extra flow targets on old tasks: latent_pred_seed_pairs (neighbouring raw seeds of a demo, both encoded now) and
     latent_pred_self_replay (offsets sampled from the head at the start of the task). Temporal seeds only.
       raw_grad         plain ER on the raw seeds only (no latent replay): an ER baseline on exactly the same buffer
+      oracle_grad      instead of a member per seed, random members' true current latents F_t(x) from their raw frames
+                       (no encoder gradient) with their actions: a perfect generator (diagnostic upper bound)
       pred_grad        as seed_offset_grad with the offset sampled from the flow head in the current encoder's space,
                        F_t(s) + G(F_t(s), proprio, actions s -> x, dt): nothing stored per sample but proprio and the
                        action sequence
@@ -568,6 +570,14 @@ class SeedDriftER(ER):
             num_workers=self.cfg.train.num_workers, sampler=EndlessRandomSampler(len(seed_all), self.cfg.seed + task)))
         self.seed_batches = [self.map_tensor_to_device(d) for d in
                              DataLoader(seed_all, batch_size=128, shuffle=False, num_workers=self.cfg.train.num_workers)]
+        if lc.drift_compensation == "oracle_grad":
+            # the raw frames of all replayed members (covered non-seed samples), a diagnostic upper bound
+            mem_all = torch.utils.data.ConcatDataset(
+                [Subset(ds, torch.nonzero(self._nonseed(e)).squeeze(1).cpu().tolist())
+                 for ds, e in zip(self.datasets, self.store)])
+            self.mem_loader = iter(DataLoader(
+                mem_all, batch_size=max(1, round(self.cfg.lifelong.replay_ratio * bs)),
+                num_workers=self.cfg.train.num_workers, sampler=EndlessRandomSampler(len(mem_all), self.cfg.seed + 1000 + task)))
 
         # replayed latents: the non-seed samples of all past tasks
         R = self._image_dim()
@@ -726,6 +736,16 @@ class SeedDriftER(ER):
             need -= len(take)
             out.append(take)
         return torch.cat(out)
+
+    @torch.no_grad()
+    def _oracle_latents(self):
+        """
+        drift_compensation=oracle_grad: a batch of random members' true current latents F_t(x) (their raw frames through
+        the current encoder in train mode, without gradient, with their own proprio and task embedding) and their action
+        chunks: a perfect generator, the upper bound of generated replay on the same buffer (members' raw frames needed).
+        """
+        b = self.policy._dp_batch(self.map_tensor_to_device(next(self.mem_loader)))
+        return self.policy.dp.obs_encoder(self.policy.dp.normalizer.normalize(b["obs"])), b["action"]
 
     def _step_offsets(self, mode, mem):
         """Offsets (F_j image space) added to the fresh seed latents for the cluster members mem."""
@@ -1338,9 +1358,12 @@ class SeedDriftER(ER):
                 if os.environ.get("SDR_NAN_DEBUG"):
                     self.dbg_off_max = off.abs().max().item()
                     self.dbg_seed_max = seed_img.detach().abs().max().item()
-            else:
+            elif mode != "oracle_grad":
                 off = self._step_offsets(mode, mem)
-            lat = torch.cat([seed_img + off, low], dim=1)
+            if mode == "oracle_grad":
+                lat, lat_act = self._oracle_latents()
+            else:
+                lat = torch.cat([seed_img + off, low], dim=1)
             global_cond = torch.cat([cond, lat], dim=0)
             actions = torch.cat([batch["action"], lat_act], dim=0)
             loss = policy.dp.compute_loss_from_global_cond(global_cond, policy.dp.normalizer["action"].normalize(actions))
