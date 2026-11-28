@@ -824,10 +824,16 @@ class SeedDriftER(ER):
         self.old_prop = torch.cat([e["cond"][:, R:R + P] for e in self.store])
         self.old_steps = torch.cat([e["actions"][:, 0] for e in self.store]).to(dev)
         self.seed_g = torch.cat([b + e["seeds"].to(dev) for b, e in zip(self.old_base, self.store)])
-        # lifelong.latent_pred_code_dim: the per-demo code of every old frame (the last task's codes still trainable
-        # during its end-of-task training)
-        self.old_code = (torch.cat([codes[demo] for codes, demo in zip(self.code_tables, self.task_demo)])
-                         if self._code_dim() > 0 else None)
+        self.old_code = self._old_code_table()
+
+    def _old_code_table(self):
+        """
+        lifelong.latent_pred_code_dim: the per-demo code of every old frame, None without codes. Gathered anew where the
+        last task's codes are still trained (its end-of-task training): a table built once keeps one autograd graph.
+        """
+        if self._code_dim() == 0:
+            return None
+        return torch.cat([codes[demo] for codes, demo in zip(self.code_tables, self.task_demo)])
 
     def _code_dim(self):
         return self.cfg.lifelong.get("latent_pred_code_dim", 0)
@@ -878,7 +884,7 @@ class SeedDriftER(ER):
             i = frames[torch.randint(len(frames), (256,), device=dev, generator=g)]
             r = lo[i] + (torch.rand(len(i), device=dev, generator=g) * (hi[i] - lo[i])).long()
             dt = r + (r >= 0).long()  # lo..-1 and 1..hi
-            c, z_in = self._ar_last_step(lat[i], i, i + dt, self.old_prop, self.old_steps, self.old_code)
+            c, z_in = self._ar_last_step(lat[i], i, i + dt, self.old_prop, self.old_steps, self._old_code_table())
             loss = head.loss(c, lat[i + dt] - z_in)
             if self.sr_cond is not None:
                 k = torch.randint(len(self.sr_cond), (256,), device=dev, generator=g)
